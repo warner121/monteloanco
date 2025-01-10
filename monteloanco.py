@@ -82,7 +82,7 @@ class Model(PyroModule):
         
         return tmat
     
-    def forward(self, idx, installments, scaling_factor, pymnts=None, demo=False):
+    def forward(self, batchidx, idx, installments, scaling_factor, pymnts=None, demo=False):
 
         # transpose the input tensors to make stacking/indexing slighly easier
         installments = installments.T
@@ -107,7 +107,7 @@ class Model(PyroModule):
             for t in range(1, num_timesteps + 1):
                 
                 # perform the monte-carlo step
-                new_hidden_states = pyro.sample(f"hidden_state_{t}", dist.Categorical(tmat[torch.arange(batch_size), hidden_states[t - 1]]))
+                new_hidden_states = pyro.sample(f"hidden_state_{batchidx}_{t}", dist.Categorical(tmat[torch.arange(batch_size), hidden_states[t - 1]]))
                    
                 # calculate the amount that must have been paid to prompt the status update, where the loan has not been charged off, else 0
                 # e.g. a change from 3 month's delinquent up to date implies (3 - 0 + 1)
@@ -119,8 +119,8 @@ class Model(PyroModule):
                 
                 # overwrite implied payment with the balance where loan has been fully paid
                 new_sim_pymnts = torch.where(
-                    new_hidden_states == 0, 
-                    total_installments - sim_pymnts.sum(0), 
+                    new_hidden_states == 0,
+                    total_installments - sim_pymnts.sum(0),
                     new_sim_pymnts
                 )
         
@@ -129,7 +129,7 @@ class Model(PyroModule):
                 sim_pymnts = torch.cat((sim_pymnts, new_sim_pymnts.unsqueeze(0)), dim=0)
                 
                 # Observation model (noisy measurement of hidden state)
-                if torch.is_tensor(pymnts): pyro.sample(f"obs_{t}", dist.Normal(sim_pymnts[1:t].sum(0), 1./scaling_factor), 
+                if torch.is_tensor(pymnts): pyro.sample(f"obs_{batchidx}_{t}", dist.Normal(sim_pymnts[1:t].sum(0), 1./scaling_factor),
                     obs=pymnts[0:t - 1].sum(0)) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
                 
         return hidden_states, sim_pymnts
@@ -161,7 +161,7 @@ class Guide(PyroModule):
             [1.,    1.,    1.,    1.,    1.,    1.,    1.,    1.,    ],
             [1e-4,  1e-4,  1e-4,  1e-4,  1e-4,  1e-4,  1e-4,  1.,    ],]).to(self.device)
 
-    def forward(self, idx, installments, scaling_factor, pymnts):
+    def forward(self, batchidx, idx, installments, scaling_factor, pymnts):
         
         # transpose the input tensors to make stacking/indexing slighly easier
         installments = installments.T
@@ -174,10 +174,10 @@ class Guide(PyroModule):
         with pyro.plate("batch", batch_size, dim=-1):
     
             # Variational parameters for the hidden states
-            tmat_prior = pyro.param("tmat_prior", 
+            tmat_prior = pyro.param(f'tmat_prior_{batchidx}',
                 pyro.distributions.Uniform(
-                    self.zeros_tmat_prior.unsqueeze(0).repeat(batch_size, 1, 1), 
-                    self.ones_tmat_prior.unsqueeze(0).repeat(batch_size, 1, 1)), 
+                    self.zeros_tmat_prior.unsqueeze(0).repeat(batch_size, 1, 1),
+                    self.ones_tmat_prior.unsqueeze(0).repeat(batch_size, 1, 1)),
                 constraint=dist.constraints.positive)
         
             # Variational posterior for the initial hidden state
@@ -185,5 +185,4 @@ class Guide(PyroModule):
         
             for t in range(1, num_timesteps + 1):
                 # Variational posterior for each hidden state
-                hidden_states = pyro.sample(f"hidden_state_{t}", dist.Categorical(tmat_prior[torch.arange(batch_size), hidden_states]))
-                
+                hidden_states = pyro.sample(f"hidden_state_{batchidx}_{t}", dist.Categorical(tmat_prior[torch.arange(batch_size), hidden_states]))
