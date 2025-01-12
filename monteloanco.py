@@ -17,7 +17,7 @@ class Dataset(Dataset):
     def __init__(self, dataframe):
 
         # drop the original index here to ensure it is suitable to double as the embeddings index later
-        self.data = dataframe.reset_index(drop=True)
+        self.data = dataframe.reset_index()
 
     def __len__(self):
 
