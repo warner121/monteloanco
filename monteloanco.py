@@ -3,52 +3,7 @@ import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
 
-from typing import List, Tuple
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset
 from pyro.nn import PyroModule
-
-
-class Dataset(Dataset):
-    '''
-    Wrap the dataframe in a custom Dataset to feed the DataLoader.
-    '''
-    
-    def __init__(self, dataframe):
-
-        # drop the original index here to ensure it is suitable to double as the embeddings index later
-        self.data = dataframe.reset_index()
-
-    def __len__(self):
-
-        # return the length of the dataset
-        return len(self.data)
-
-    def __getitem__(self, idx):
-
-        # return a row of the dataset given by idx
-        row = self.data.iloc[idx]
-        return idx, row.length, row.installment, row.pymnt
-
-
-def collate_fn(data: List[Tuple[int, int, torch.Tensor, torch.Tensor]]):
-    '''
-    Define custom collate function to ensure all sequences within a DataLoader batch are the same length.
-    '''
-
-    # fist sort the keys by the second element of the dataset (length) to ensure longest sequence is processed first
-    data.sort(key=lambda x: x[1], reverse=True)
-
-    # unpack the elements of the dataset and make the index a tensor
-    idx, length, installment, pymnt = zip(*data)
-    idx = torch.tensor(idx)
-
-    # pad installment and pymnt vectors to length of the first
-    installment = pad_sequence(installment, batch_first=True, padding_value=0.)
-    pymnt = pad_sequence(pymnt, batch_first=True, padding_value=0.)
-
-    # return homogenised batch
-    return idx, length, installment, pymnt
 
 
 class Model(PyroModule):
