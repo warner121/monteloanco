@@ -18,6 +18,17 @@ class Model(PyroModule):
         self.linear2 = torch.nn.Linear(64, 64)
 
         # define a hand-crafted matrix for demonstration purposes only
+        self.tmat_mask = torch.tensor([
+            [ False,  True,  True,  True,  True,  True,  True,  True, ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
+            [ False, False, False,  True,  True,  True,  True,  True, ],
+            [ False, False, False, False,  True,  True,  True,  True, ],
+            [ False, False, False, False, False,  True,  True,  True, ],
+            [ False, False, False, False, False, False,  True,  True, ],
+            [ False, False, False, False, False, False, False,  True, ],
+            [ False, False, False, False, False, False, False, False, ],
+            [  True,  True,  True,  True,  True,  True,  True, False, ],]).to(self.device)
+        
+        # define a hand-crafted matrix for demonstration purposes only
         self.tmat_demo = torch.tensor([
             [1.,    0.,   0.,    0.,  0.,  0.,  0.,  0., ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
             [0.006, 0.96, 0.034, 0.,  0.,  0.,  0.,  0., ],
@@ -33,7 +44,10 @@ class Model(PyroModule):
         tmat = self.embeddings(idx)
         tmat = self.linear1(tmat)
         tmat = self.linear2(F.relu(tmat))
-        tmat = F.softmax(tmat.reshape(batch_size, 8, 8), dim=-1)
+        tmat = tmat.reshape(batch_size, 8, 8)
+        tmat = tmat.masked_fill(self.tmat_mask, float('-inf'))
+        tmat = F.softmax(tmat, dim=-1)
+        tmat = torch.nan_to_num(tmat, nan=0.0)
         
         return tmat
     
