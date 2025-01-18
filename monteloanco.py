@@ -8,9 +8,10 @@ from pyro.nn import PyroModule
 
 class Model(PyroModule):
     
-    def __init__(self, input_size, embedding_size, device='cuda:0'):
+    def __init__(self, input_size, embedding_size, device='cuda:0', scaling_factor=1_000):
         super().__init__()
         self.device = device
+        self.scaling_factor = scaling_factor # scale to make the gradients more manageable ($500 becomes 0.5 etc.)
 
         # define the embedding and linear terms to translate embedding to transition matrix
         self.embeddings = torch.nn.Embedding(input_size, embedding_size)
@@ -51,11 +52,11 @@ class Model(PyroModule):
         
         return tmat
     
-    def forward(self, batchidx, idx, installments, scaling_factor, pymnts=None, demo=False):
+    def forward(self, batchidx, idx, installments, pymnts=None, demo=False):
 
         # transpose the input tensors to make stacking/indexing slighly easier
-        installments = installments.T
-        if torch.is_tensor(pymnts): pymnts = pymnts.T
+        installments = installments.T / self.scaling_factor
+        if torch.is_tensor(pymnts): pymnts = pymnts.T / self.scaling_factor
     
         # determine the shape of the inputs
         num_timesteps = installments.shape[0]
@@ -98,10 +99,10 @@ class Model(PyroModule):
                 sim_pymnts = torch.cat((sim_pymnts, new_sim_pymnts.unsqueeze(0)), dim=0)
                 
                 # Observation model (noisy measurement of hidden state)
-                if torch.is_tensor(pymnts): pyro.sample(f"obs_{batchidx}_{t}", dist.Normal(sim_pymnts[1:t].sum(0), 1./scaling_factor),
+                if torch.is_tensor(pymnts): pyro.sample(f"obs_{batchidx}_{t}", dist.Normal(sim_pymnts[1:t].sum(0), 1. / self.scaling_factor),
                     obs=pymnts[0:t - 1].sum(0)) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
                 
-        return hidden_states, sim_pymnts
+        return hidden_states, sim_pymnts * self.scaling_factor
 
 
 class Guide(PyroModule):
@@ -130,7 +131,7 @@ class Guide(PyroModule):
             [1.,    1.,    1.,    1.,    1.,    1.,    1.,    1.,    ],
             [1e-4,  1e-4,  1e-4,  1e-4,  1e-4,  1e-4,  1e-4,  1.,    ],]).to(self.device)
 
-    def forward(self, batchidx, idx, installments, scaling_factor, pymnts):
+    def forward(self, batchidx, idx, installments, pymnts):
         
         # transpose the input tensors to make stacking/indexing slighly easier
         installments = installments.T
