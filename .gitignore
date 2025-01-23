@@ -173,4 +173,4 @@ cython_debug/
 # Custom
 *.zip
 *.csv.gz
-*.parquet.gz
+*.jsonl.gz
