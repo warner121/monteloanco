@@ -102,7 +102,7 @@ class Model(PyroModule):
                 if torch.is_tensor(pymnts): pyro.sample(f"obs_{batchidx}_{t}", dist.Normal(sim_pymnts[1:t].sum(0), 1. / self.scaling_factor),
                     obs=pymnts[0:t - 1].sum(0)) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
                 
-        return hidden_states, sim_pymnts * self.scaling_factor
+        return hidden_states[1:], sim_pymnts[1:] * self.scaling_factor
 
 
 class Guide(PyroModule):
