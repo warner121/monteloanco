@@ -38,7 +38,7 @@ class Model(PyroModule):
         self.scaling_factor = scaling_factor # scale to make the gradients more manageable ($500 becomes 0.5 etc.)
 
         # define the embedding and linear terms to translate embedding to transition matrix
-        self.embeddings = torch.nn.Embedding(input_size, embedding_size)
+        self.embeddings = pyro.param("embeddings", torch.randn(input_size, 64).to(self.device))
         self.linear1 = torch.nn.Linear(embedding_size, 64)
         self.linear2 = torch.nn.Linear(64, 64)
 
@@ -66,9 +66,7 @@ class Model(PyroModule):
 
     def _idx_to_tmat(self, idx, batch_size):
         
-        tmat = self.embeddings(idx)
-        tmat = self.linear1(tmat)
-        tmat = self.linear2(F.relu(tmat))
+        tmat = self.embeddings[idx]
         tmat = tmat.reshape(batch_size, 8, 8)
         tmat = tmat.masked_fill(self.tmat_mask, float('-inf'))
         tmat = F.softmax(tmat, dim=-1)
@@ -171,10 +169,10 @@ class Guide(PyroModule):
     
             # Variational parameters for the hidden states
             tmat_prior = pyro.param(f'tmat_prior_{batchidx}',
-                pyro.distributions.Normal(
+                dist.Normal(
                     torch.zeros(batch_size, 8, 8).to(self.device),
                     torch.ones(batch_size, 8, 8).to(self.device)))
-            
+
             # Variational posterior for the initial hidden state
             hidden_states = torch.ones(batch_size, dtype=torch.int32).to(self.device)
         
