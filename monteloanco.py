@@ -30,13 +30,38 @@ class GroupedBatchSampler(BatchSampler):
         return len(self.batches)
 
 
-def tmat_reshape(model, tmat):
+class Template():
+    
+    # define a mask for forbidden transitions
+    MASK = torch.tensor([
+        [ False,  True,  True,  True,  True,  True,  True,  True, ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
+        [ False, False, False,  True,  True,  True,  True,  True, ],
+        [ False, False, False, False,  True,  True,  True,  True, ],
+        [ False, False, False, False, False,  True,  True,  True, ],
+        [ False, False, False, False, False, False,  True,  True, ],
+        [ False, False, False, False, False, False, False,  True, ],
+        [ False, False, False, False, False, False, False, False, ],
+        [  True,  True,  True,  True,  True,  True,  True, False, ],])
+
+    # define a hand-crafted matrix for demonstration purposes only
+    DEMO = torch.tensor([
+            [1.,    0.,   0.,    0.,  0.,  0.,  0.,  0., ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
+            [0.006, 0.96, 0.034, 0.,  0.,  0.,  0.,  0., ],
+            [0.,    0.2,  0.2,   0.6, 0.,  0.,  0.,  0., ],
+            [0.,    0.2,  0.,    0.2, 0.6, 0.,  0.,  0., ],
+            [0.,    0.2,  0.,    0.,  0.2, 0.6, 0.,  0., ],
+            [0.,    0.2,  0.,    0.,  0.,  0.2, 0.6, 0., ],
+            [0.,    0.2,  0.,    0.,  0.,  0.,  0.2, 0.6,],
+            [0.,    0.,   0.,    0.,  0.,  0.,  0.,  1., ],])
+
+
+def tmat_reshape(tmat, weight1, bias1, device):
     
     #tmat = model.linear1(tmat)
     #tmat = model.linear2(F.relu(tmat))
-    #tmat = torch.matmul(tmat, model.weight1.T) + model.bias1
+    tmat = torch.matmul(tmat, weight1.T) + bias1
     tmat = tmat.reshape(-1, 8, 8)
-    tmat = tmat.masked_fill(model.tmat_mask, float('-inf'))
+    tmat = tmat.masked_fill(Template.MASK.to(device), float('-inf'))
     tmat = F.softmax(tmat, dim=-1)
     tmat = torch.nan_to_num(tmat, nan=0.0)
     return tmat
@@ -53,28 +78,6 @@ class Model(PyroModule):
         #self.linear1 = torch.nn.Linear(self.embedding_size, 64)
         #self.linear2 = torch.nn.Linear(64, 64)
 
-        # define a hand-crafted matrix for demonstration purposes only
-        self.tmat_mask = torch.tensor([
-            [ False,  True,  True,  True,  True,  True,  True,  True, ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-            [ False, False, False,  True,  True,  True,  True,  True, ],
-            [ False, False, False, False,  True,  True,  True,  True, ],
-            [ False, False, False, False, False,  True,  True,  True, ],
-            [ False, False, False, False, False, False,  True,  True, ],
-            [ False, False, False, False, False, False, False,  True, ],
-            [ False, False, False, False, False, False, False, False, ],
-            [  True,  True,  True,  True,  True,  True,  True, False, ],]).to(self.device)
-        
-        # define a hand-crafted matrix for demonstration purposes only
-        self.tmat_demo = torch.tensor([
-            [1.,    0.,   0.,    0.,  0.,  0.,  0.,  0., ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-            [0.006, 0.96, 0.034, 0.,  0.,  0.,  0.,  0., ],
-            [0.,    0.2,  0.2,   0.6, 0.,  0.,  0.,  0., ],
-            [0.,    0.2,  0.,    0.2, 0.6, 0.,  0.,  0., ],
-            [0.,    0.2,  0.,    0.,  0.2, 0.6, 0.,  0., ],
-            [0.,    0.2,  0.,    0.,  0.,  0.2, 0.6, 0., ],
-            [0.,    0.2,  0.,    0.,  0.,  0.,  0.2, 0.6,],
-            [0.,    0.,   0.,    0.,  0.,  0.,  0.,  1., ],]).to(self.device)
-    
     def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, pymnts=None, num_timesteps=None, demo=False):
 
         # transpose the input tensors to make stacking/indexing slighly easier
@@ -98,13 +101,13 @@ class Model(PyroModule):
         hidden_states = torch.ones((1, batch_size), dtype=torch.int32).to(self.device)
 
         # define the embedding and linear terms to translate embedding to transition matrix
-        self.embeddings = pyro.param(f"embeddings_{batch_id}", torch.randn(batch_size, self.embedding_size).to(self.device))
-        #self.weight1 = pyro.param("model.weight1", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
-        #self.bias1 = pyro.param("model.bias1", torch.randn(64).to(self.device) * 0.1)
-        tmat = tmat_reshape(self, self.embeddings)
+        embeddings = pyro.param(f"embeddings_{batch_id}", torch.randn(batch_size, self.embedding_size).to(self.device))
+        weight1 = pyro.param(f"model.weight1_{batch_id}", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
+        bias1 = pyro.param(f"model.bias1_{batch_id}", torch.randn(64).to(self.device) * 0.1)
+        tmat = tmat_reshape(embeddings, weight1, bias1, self.device)
 
         # overwrite with the demo matrix if demo
-        if demo: tmat = self.tmat_demo.unsqueeze(0).repeat(batch_size, 1, 1)
+        if demo: tmat = Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1)
         
         with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
             for t in range(1, num_timesteps + 1):
@@ -163,17 +166,6 @@ class Guide(PyroModule):
 
         #self.linear1 = torch.nn.Linear(self.embedding_size, 64)
         #self.linear2 = torch.nn.Linear(64, 64)
-
-        # define a hand-crafted matrix for demonstration purposes only
-        self.tmat_mask = torch.tensor([
-            [ False,  True,  True,  True,  True,  True,  True,  True, ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-            [ False, False, False,  True,  True,  True,  True,  True, ],
-            [ False, False, False, False,  True,  True,  True,  True, ],
-            [ False, False, False, False, False,  True,  True,  True, ],
-            [ False, False, False, False, False, False,  True,  True, ],
-            [ False, False, False, False, False, False, False,  True, ],
-            [ False, False, False, False, False, False, False, False, ],
-            [  True,  True,  True,  True,  True,  True,  True, False, ],]).to(self.device)
         
     def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, pymnts):
         
@@ -185,10 +177,10 @@ class Guide(PyroModule):
         batch_size = pymnts.shape[1]
 
         # define the embedding and linear terms to translate embedding to transition matrix
-        self.embeddings = pyro.param(f"embeddings_prior_{batch_id}", torch.randn(batch_size, self.embedding_size).to(self.device))
-        #self.weight1 = pyro.param("guide.weight1", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
-        #self.bias1 = pyro.param("guide.bias1", torch.randn(64).to(self.device) * 0.1)
-        tmat_prior = tmat_reshape(self, self.embeddings)
+        embeddings = pyro.param(f"embeddings_prior_{batch_id}", torch.randn(batch_size, self.embedding_size).to(self.device))
+        weight1 = pyro.param(f"guide.weight1_{batch_id}", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
+        bias1 = pyro.param(f"guide.bias1_{batch_id}", torch.randn(64).to(self.device) * 0.1)
+        tmat_prior = tmat_reshape(embeddings, weight1, bias1, self.device)
 
         with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
