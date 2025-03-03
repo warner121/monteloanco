@@ -94,9 +94,10 @@ class Model(PyroModule):
         # initalise amortisation
         interest_paid = torch.zeros((1, batch_size)).to(self.device)
         principal_paid = torch.zeros((1, batch_size)).to(self.device)
-        remaining_balance = loan_amnt.clone()
         
         # initalise other variables
+        balances = loan_amnt.clone().unsqueeze(0)
+        interest_owed = torch.zeros((1, batch_size)).to(self.device)
         sim_pymnts = torch.zeros((1, batch_size)).to(self.device)
         hidden_states = torch.ones((1, batch_size), dtype=torch.int32).to(self.device)
 
@@ -107,15 +108,16 @@ class Model(PyroModule):
         tmat = tmat_reshape(embeddings, weight1, bias1, self.device)
 
         # overwrite with the demo matrix if demo
-        if demo: tmat = Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1)
+        if demo: tmat = Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
         
         with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
             for t in range(1, num_timesteps + 1):
 
                 # add interest to the balance
-                interest_payment = remaining_balance * int_rate / 1200
-                remaining_balance += interest_payment
-
+                prev_balances = balances[t - 1]
+                interest_owed += prev_balances * int_rate / 1200
+                interest_owed = interest_owed.squeeze(0)
+        
                 # perform the monte-carlo step
                 new_hidden_states = pyro.sample(f"hidden_state_{batch_id}_{t}", dist.Categorical(tmat[batch_idx, hidden_states[t - 1]]))
                    
@@ -123,28 +125,25 @@ class Model(PyroModule):
                 # e.g. a change from 3 month's delinquent up to date implies (3 - 0 + 1)
                 new_sim_pymnts = torch.where(
                     new_hidden_states < 7,
-                    (hidden_states[t - 1] - new_hidden_states + 1) * installments, # installments is 1 shorter than the simulated vectors as the origin is omitted
+                    (hidden_states[t - 1] - new_hidden_states + 1) * installments,
                     torch.zeros(batch_size).to(self.device)
                 )
                 
                 # overwrite implied payment with the balance where loan has been fully paid
                 new_sim_pymnts = torch.where(
                     new_hidden_states == 0,
-                    remaining_balance,
+                    prev_balances + interest_owed,
                     new_sim_pymnts
                 )
 
-                # calculate interest and principal
-                interest_payment = torch.where(
-                    new_sim_pymnts == 0, 
-                    0, 
-                    interest_payment)
-                principal_payment = new_sim_pymnts - interest_payment
-
-                # ensure we don't overpay on the last payment
-                remaining_balance -= new_sim_pymnts
+                # ensure interest is paid first
+                interest_payment = torch.minimum(new_sim_pymnts, interest_owed)
+                principal_payment = torch.clamp(new_sim_pymnts - interest_payment, min=0)
+                new_balances = torch.clamp(prev_balances - principal_payment, min=0)
+                interest_owed = interest_owed - interest_payment
                 
                 # append new timestep to histories
+                balances = torch.cat((balances, new_balances.unsqueeze(0)), dim=0)
                 hidden_states = torch.cat((hidden_states, new_hidden_states.unsqueeze(0)), dim=0)
                 sim_pymnts = torch.cat((sim_pymnts, new_sim_pymnts.unsqueeze(0)), dim=0)
                 interest_paid = torch.cat((interest_paid, interest_payment.unsqueeze(0)), dim=0)
@@ -177,10 +176,10 @@ class Guide(PyroModule):
         batch_size = pymnts.shape[1]
 
         # define the embedding and linear terms to translate embedding to transition matrix
-        embeddings = pyro.param(f"embeddings_prior_{batch_id}", torch.randn(batch_size, self.embedding_size).to(self.device))
-        weight1 = pyro.param(f"guide.weight1_{batch_id}", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
-        bias1 = pyro.param(f"guide.bias1_{batch_id}", torch.randn(64).to(self.device) * 0.1)
-        tmat_prior = tmat_reshape(embeddings, weight1, bias1, self.device)
+        tmat_prior = pyro.param(
+            f"tmat_prior_{batch_id}", 
+            Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1).to(self.device), 
+            constraint=torch.distributions.constraints.positive)
 
         with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
