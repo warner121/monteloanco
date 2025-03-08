@@ -103,8 +103,8 @@ class Model(PyroModule):
 
         # define the embedding and linear terms to translate embedding to transition matrix
         embeddings = pyro.param(f"embeddings_{batch_id}", torch.randn(batch_size, self.embedding_size).to(self.device))
-        weight1 = pyro.param(f"model.weight1_{batch_id}", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
-        bias1 = pyro.param(f"model.bias1_{batch_id}", torch.randn(64).to(self.device) * 0.1)
+        weight1 = pyro.param(f"model.weight1", torch.randn(64, self.embedding_size).to(self.device) * 0.1)
+        bias1 = pyro.param(f"model.bias1", torch.randn(64).to(self.device) * 0.1)
         tmat = tmat_reshape(embeddings, weight1, bias1, self.device)
 
         # overwrite with the demo matrix if demo
