@@ -73,10 +73,7 @@ class Model(PyroModule):
         super().__init__()
         self.embedding_size = embedding_size
         self.device = device
-        self.scaling_factor = scaling_factor # scale to make the gradients more manageable ($500 becomes 0.5 etc.)
-        
-        #self.linear1 = torch.nn.Linear(self.embedding_size, 64)
-        #self.linear2 = torch.nn.Linear(64, 64)
+        self.scaling_factor = scaling_factor # scale to make the gradients more manageable ($500 becomes 0.0005 etc.)
 
     def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, pymnts=None, num_timesteps=None, demo=False):
 
@@ -162,9 +159,6 @@ class Guide(PyroModule):
         super().__init__()
         self.embedding_size = embedding_size
         self.device = device
-
-        #self.linear1 = torch.nn.Linear(self.embedding_size, 64)
-        #self.linear2 = torch.nn.Linear(64, 64)
         
     def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, pymnts):
         
