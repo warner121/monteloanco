@@ -11,6 +11,8 @@ from collections import defaultdict
 class GroupedBatchSampler(BatchSampler):
     def __init__(self, dataset, batch_size, grouper='pymnt'):
 
+        
+
         # Group indices by tensor length
         self.length_to_indices = defaultdict(list)
         for idx in range(len(dataset)):
@@ -116,7 +118,10 @@ class Model(PyroModule):
                 interest_owed = interest_owed.squeeze(0)
         
                 # perform the monte-carlo step
-                new_hidden_states = pyro.sample(f"hidden_state_{batch_id}_{t}", dist.Categorical(tmat[batch_idx, hidden_states[t - 1]]))
+                new_hidden_states = pyro.sample(
+                    f"hidden_state_{batch_id}_{t}", 
+                    dist.Categorical(tmat[batch_idx, hidden_states[t - 1]])
+                )
                    
                 # calculate the amount that must have been paid to prompt the status update, where the loan has not been charged off, else 0
                 # e.g. a change from 3 month's delinquent up to date implies (3 - 0 + 1)
@@ -147,10 +152,19 @@ class Model(PyroModule):
                 principal_paid = torch.cat((principal_paid, principal_payment.unsqueeze(0)), dim=0)
                 
                 # Observation model (noisy measurement of hidden state)
-                if torch.is_tensor(pymnts): pyro.sample(f"obs_{batch_id}_{t}", dist.Normal(sim_pymnts[1:t].sum(0), 500. / self.scaling_factor),
-                    obs=pymnts[0:t - 1].sum(0)) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
+                if torch.is_tensor(pymnts): 
+                    pyro.sample(
+                        f"obs_{batch_id}_{t}", 
+                        dist.Normal(sim_pymnts[1:t].sum(0), 500. / self.scaling_factor),
+                        obs=pymnts[0:t - 1].sum(0) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
+                    )
 
-        return hidden_states[1:], sim_pymnts[1:] * self.scaling_factor, interest_paid[1:] * self.scaling_factor, principal_paid[1:] * self.scaling_factor
+        return (
+            hidden_states[1:], 
+            sim_pymnts[1:] * self.scaling_factor, 
+            interest_paid[1:] * self.scaling_factor, 
+            principal_paid[1:] * self.scaling_factor
+        )
 
 
 class Guide(PyroModule):
