@@ -11,8 +11,6 @@ from collections import defaultdict
 class GroupedBatchSampler(BatchSampler):
     def __init__(self, dataset, batch_size, grouper='pymnt'):
 
-        
-
         # Group indices by tensor length
         self.length_to_indices = defaultdict(list)
         for idx in range(len(dataset)):
