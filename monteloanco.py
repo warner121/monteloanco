@@ -149,13 +149,13 @@ class Model(PyroModule):
                 interest_paid = torch.cat((interest_paid, interest_payment.unsqueeze(0)), dim=0)
                 principal_paid = torch.cat((principal_paid, principal_payment.unsqueeze(0)), dim=0)
                 
-                # Observation model (noisy measurement of hidden state)
-                if torch.is_tensor(pymnts): 
-                    pyro.sample(
-                        f"obs_{batch_id}_{t}", 
-                        dist.Normal(sim_pymnts[1:t].sum(0), 500. / self.scaling_factor),
-                        obs=pymnts[0:t - 1].sum(0) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
-                    )
+            # Observation model (noisy measurement of hidden state)
+            if torch.is_tensor(pymnts):                 
+                pyro.sample(
+                    f"obs_{batch_id}_{t}", 
+                    dist.Normal(sim_pymnts[1:t].sum(0), 100. / self.scaling_factor),
+                    obs=pymnts[0:t - 1].sum(0) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
+                )
 
         return (
             hidden_states[1:], 
