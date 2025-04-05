@@ -77,7 +77,7 @@ class Model(PyroModule):
         # transpose the input tensors to make stacking/indexing slighly easier
         installments = installments / self.scaling_factor
         loan_amnt = loan_amnt / self.scaling_factor
-
+        
         # determine shape of batch
         batch_size=len(batch_idx)
         if not num_timesteps: num_timesteps = 60
@@ -161,9 +161,8 @@ class Model(PyroModule):
 
 class Guide(PyroModule):
     
-    def __init__(self, embedding_size, device='cuda:0'):
+    def __init__(self, device='cuda:0'):
         super().__init__()
-        self.embedding_size = embedding_size
         self.device = device
         
     def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, total_pre_chargeoff, num_timesteps):
