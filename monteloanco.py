@@ -9,13 +9,13 @@ from collections import defaultdict
 
 
 class GroupedBatchSampler(BatchSampler):
-    def __init__(self, dataset, batch_size, grouper='pymnt'):
+    def __init__(self, dataset, batch_size, grouper='n_report_d'):
 
         # Group indices by tensor length
         self.length_to_indices = defaultdict(list)
         for idx in range(len(dataset)):
-            tensor_length = len(dataset[idx][grouper])
-            self.length_to_indices[tensor_length].append(idx)
+            n_report_d = dataset[idx][grouper]
+            self.length_to_indices[n_report_d].append(idx)
 
         # Create batches within each group
         self.batches = []
@@ -25,9 +25,6 @@ class GroupedBatchSampler(BatchSampler):
 
     def __iter__(self):
         return iter(self.batches)
-
-    def __len__(self):
-        return len(self.batches)
 
 
 class Template():
@@ -75,18 +72,15 @@ class Model(PyroModule):
         self.device = device
         self.scaling_factor = scaling_factor # scale to make the gradients more manageable ($500 becomes 0.0005 etc.)
 
-    def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, pymnts=None, num_timesteps=None, demo=False):
+    def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, total_pre_chargeoff=None, num_timesteps=None, demo=False):
 
         # transpose the input tensors to make stacking/indexing slighly easier
         installments = installments / self.scaling_factor
         loan_amnt = loan_amnt / self.scaling_factor
 
+        # determine shape of batch
         batch_size=len(batch_idx)
-        if torch.is_tensor(pymnts): 
-            pymnts = pymnts.T / self.scaling_factor
-            num_timesteps = pymnts.shape[0]
-        elif not num_timesteps:
-            num_timesteps = 36
+        if not num_timesteps: num_timesteps = 60
 
         # initalise amortisation
         interest_paid = torch.zeros((1, batch_size)).to(self.device)
@@ -150,11 +144,11 @@ class Model(PyroModule):
                 principal_paid = torch.cat((principal_paid, principal_payment.unsqueeze(0)), dim=0)
                 
             # Observation model (noisy measurement of hidden state)
-            if torch.is_tensor(pymnts):                 
+            if torch.is_tensor(total_pre_chargeoff):                 
                 pyro.sample(
                     f"obs_{batch_id}_{t}", 
                     dist.Normal(sim_pymnts[1:t].sum(0), 100. / self.scaling_factor),
-                    obs=pymnts[0:t - 1].sum(0) # pymnts is 1 shorter than the simulated vectors as the origin is omitted
+                    obs=total_pre_chargeoff / self.scaling_factor
                 )
 
         return (
@@ -172,14 +166,10 @@ class Guide(PyroModule):
         self.embedding_size = embedding_size
         self.device = device
         
-    def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, pymnts):
+    def forward(self, batch_id, batch_idx, installments, loan_amnt, int_rate, total_pre_chargeoff, num_timesteps):
         
-        # transpose the input tensors to make stacking/indexing slighly easier
-        pymnts = pymnts.T
-    
         # determine the shape of the inputs
-        num_timesteps = pymnts.shape[0]
-        batch_size = pymnts.shape[1]
+        batch_size=len(batch_idx)
 
         # define the embedding and linear terms to translate embedding to transition matrix
         tmat_prior = pyro.param(
