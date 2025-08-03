@@ -1,0 +1,15 @@
+[project]
+name = "monteloanco"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ipywidgets>=8.1.7",
+    "jupyterlab>=4.4.4",
+    "pandas>=2.3.0",
+    "torch<2.6",
+    "pyro-ppl>=1.9.1",
+    "scipy>=1.15.3",
+    "seaborn>=0.13.2",
+]
