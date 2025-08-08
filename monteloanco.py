@@ -39,18 +39,18 @@ class Template():
         [ False, False, False, False, False, False,  True,  True, ],
         [ False, False, False, False, False, False, False,  True, ],
         [ False, False, False, False, False, False, False, False, ],
-        [  True,  True,  True,  True,  True,  True,  True, False, ],])
+        [  True,  True,  True,  True,  True,  True,  True, False, ]])
 
     # Define a hand-crafted matrix for demonstration purposes only
     DEMO = torch.tensor([
-            [1.,    0.,   0.,    0.,  0.,  0.,  0.,  0., ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-            [0.006, 0.96, 0.034, 0.,  0.,  0.,  0.,  0., ],
-            [0.,    0.2,  0.2,   0.6, 0.,  0.,  0.,  0., ],
-            [0.,    0.2,  0.,    0.2, 0.6, 0.,  0.,  0., ],
-            [0.,    0.2,  0.,    0.,  0.2, 0.6, 0.,  0., ],
-            [0.,    0.2,  0.,    0.,  0.,  0.2, 0.6, 0., ],
-            [0.,    0.2,  0.,    0.,  0.,  0.,  0.2, 0.6,],
-            [0.,    0.,   0.,    0.,  0.,  0.,  0.,  1., ],])
+        [1.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
+        [0.0087, 0.9829, 0.0084, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
+        [0.1541, 0.4723, 0.1541, 0.2195, 0.0000, 0.0000, 0.0000, 0.0000],
+        [0.1439, 0.3408, 0.1439, 0.1439, 0.2274, 0.0000, 0.0000, 0.0000],
+        [0.1310, 0.2481, 0.1310, 0.1310, 0.1310, 0.2281, 0.0000, 0.0000],
+        [0.1189, 0.1820, 0.1189, 0.1189, 0.1189, 0.1189, 0.2236, 0.0000],
+        [0.1089, 0.1352, 0.1089, 0.1089, 0.1089, 0.1089, 0.1089, 0.2111],
+        [0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 1.0000]])
 
 
 class TransitionMatrixNet(nn.Module):
