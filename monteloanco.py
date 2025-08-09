@@ -43,23 +43,23 @@ class Template():
 
     # Define a hand-crafted matrix for demonstration purposes only
     DEMO = torch.tensor([
-        [1.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-        [0.0087, 0.9829, 0.0084, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
-        [0.1541, 0.4723, 0.1541, 0.2195, 0.0000, 0.0000, 0.0000, 0.0000],
-        [0.1439, 0.3408, 0.1439, 0.1439, 0.2274, 0.0000, 0.0000, 0.0000],
-        [0.1310, 0.2481, 0.1310, 0.1310, 0.1310, 0.2281, 0.0000, 0.0000],
-        [0.1189, 0.1820, 0.1189, 0.1189, 0.1189, 0.1189, 0.2236, 0.0000],
-        [0.1089, 0.1352, 0.1089, 0.1089, 0.1089, 0.1089, 0.1089, 0.2111],
-        [0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 1.0000]])
+            [1.,    0.,   0.,    0.,  0.,  0.,  0.,  0., ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
+            [0.005, 0.96, 0.035, 0.,  0.,  0.,  0.,  0., ],
+            [0.,    0.5,  0.,    0.5, 0.,  0.,  0.,  0., ],
+            [0.,    0.4,  0.,    0.,  0.6, 0.,  0.,  0., ],
+            [0.,    0.3,  0.,    0.,  0,   0.7, 0.,  0., ],
+            [0.,    0.2,  0.,    0.,  0.,  0,   0.8, 0., ],
+            [0.,    0.1,  0.,    0.,  0.,  0.,  0.,  0.9,],
+            [0.,    0.,   0.,    0.,  0.,  0.,  0.,  1., ],])
 
 
 class TransitionMatrixNet(nn.Module):
     """Neural network to generate transition matrices from embeddings."""
     
-    def __init__(self, embedding_size, hidden_size=64, device='cuda:0'):
+    def __init__(self, embedding_size, device='cuda:0'):
         super().__init__()
         self.device = device
-        self.linear1 = nn.Linear(embedding_size, hidden_size)
+        self.linear1 = nn.Linear(embedding_size, 64)
         
         # Register the mask as a buffer so it moves with the module
         self.register_buffer('mask', Template.MASK)
