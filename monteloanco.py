@@ -9,25 +9,6 @@ from torch.utils.data import BatchSampler
 from collections import defaultdict
 
 
-class GroupedBatchSampler(BatchSampler):
-    def __init__(self, dataset, batch_size, grouper='n_report_d'):
-
-        # Group indices by tensor length
-        self.length_to_indices = defaultdict(list)
-        for idx in range(len(dataset)):
-            n_report_d = dataset[idx][grouper]
-            self.length_to_indices[n_report_d].append(idx)
-
-        # Create batches within each group
-        self.batches = []
-        for length, indices in self.length_to_indices.items():
-            for i in range(0, len(indices), batch_size):
-                self.batches.append(indices[i:i + batch_size])
-
-    def __iter__(self):
-        return iter(self.batches)
-
-
 class Template():
     
     # Define a mask for forbidden transitions
@@ -43,14 +24,14 @@ class Template():
 
     # Define a hand-crafted matrix for demonstration purposes only
     DEMO = torch.tensor([
-            [1.,    0.,   0.,    0.,  0.,  0.,  0.,  0., ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-            [0.005, 0.98, 0.015, 0.,  0.,  0.,  0.,  0., ],
-            [0.,    0.2,  0.2,   0.6, 0.,  0.,  0.,  0., ],
-            [0.,    0.2,  0.,    0.2, 0.6, 0.,  0.,  0., ],
-            [0.,    0.2,  0.,    0.,  0.2, 0.6, 0.,  0., ],
-            [0.,    0.2,  0.,    0.,  0.,  0.2, 0.6, 0., ],
-            [0.,    0.2,  0.,    0.,  0.,  0.,  0.2, 0.6,],
-            [0.,    0.,   0.,    0.,  0.,  0.,  0.,  1., ]])
+            [1.,    0.,   0.,     0.,   0.,   0.,   0.,   0.,  ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
+            [0.005, 0.98, 0.015,  0.,   0.,   0.,   0.,   0.,  ],
+            [0.,    0.01, 0.01,   0.98, 0.,   0.,   0.,   0.,  ],
+            [0.,    0.01, 0.,     0.01, 0.98, 0.,   0.,   0.,  ],
+            [0.,    0.01, 0.,     0.,   0.01, 0.98, 0.,   0.,  ],
+            [0.,    0.01, 0.,     0.,   0.,   0.01, 0.98, 0.,  ],
+            [0.,    0.01, 0.,     0.,   0.,   0.,   0.01, 0.98,],
+            [0.,    0.,   0.,     0.,   0.,   0.,   0.,   1.,  ]])
 
 
 class TransitionMatrixNet(nn.Module):
@@ -92,12 +73,62 @@ class TransitionMatrixNet(nn.Module):
         return tmat
 
 
+def _prepare_num_timesteps(num_timesteps, batch_size, device):
+    """
+    Helper to normalize num_timesteps to a tensor.
+    
+    Args:
+        num_timesteps: None or tensor of shape (batch_size,)
+        batch_size: Size of current batch
+        device: Device to place tensor on
+        
+    Returns:
+        Tensor of shape (batch_size,) with dtype torch.long
+    """
+    if torch.is_tensor(num_timesteps):
+        num_timesteps = num_timesteps.to(device)
+    else:
+        num_timesteps = torch.full((batch_size,), num_timesteps, dtype=torch.long, device=device)
+
+    return num_timesteps
+
+
+def _apply_timestep_mask(num_timesteps, max_timesteps, target, device):
+    """
+    Helper to mask tensor elements that exeed the bounds of num_timesteps.
+    
+    Args:
+        num_timesteps: Tensor of shape (batch_size,)
+        max_timesteps: Maximum number of timesteps simulated
+        target: Full tensor to which mask is applied
+        device: Device to place tensor on
+    """
+    timestep_range = torch.arange(1, max_timesteps + 1, device=device).unsqueeze(1)
+    mask = timestep_range <= num_timesteps.unsqueeze(0)
+    
+    return target * mask
+            
+
 def model(batch_id, batch_idx, installments, loan_amnt, int_rate, 
-          total_pre_chargeoff=None, num_timesteps=None, demo=False,
+          total_pre_chargeoff=None, num_timesteps=60, demo=False,
           embedding_size=3, device='cuda:0', scaling_factor=1_000_000,
           transition_net=None):
     """
     Pyro model for loan state transitions and payments.
+    
+    Args:
+        batch_id: Identifier for the batch
+        batch_idx: Indices of loans in the batch
+        installments: Monthly installment amounts (batch_size,)
+        loan_amnt: Initial loan amounts (batch_size,)
+        int_rate: Annual interest rates (batch_size,)
+        total_pre_chargeoff: Observed total payments before chargeoff (batch_size,), optional
+        num_timesteps: Number of observed timesteps per loan (batch_size,), optional
+        demo: Whether to use demo transition matrix
+        embedding_size: Size of loan embeddings
+        device: Device to run on
+        scaling_factor: Factor to scale monetary amounts
+        transition_net: Neural network for generating transition matrices
     """
     
     # Scale inputs
@@ -106,23 +137,24 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
     
     # Determine shape of batch
     batch_size = len(batch_idx)
-    if not num_timesteps: 
-        num_timesteps = 60
-
-    # Initialize amortization
-    interest_paid = torch.zeros((1, batch_size)).to(device)
-    principal_paid = torch.zeros((1, batch_size)).to(device)
     
-    # Initialize other variables
-    balances = loan_amnt.clone().unsqueeze(0)
-    interest_owed = torch.zeros((1, batch_size)).to(device)
-    sim_pymnts = torch.zeros((1, batch_size)).to(device)
-    hidden_states = torch.ones((1, batch_size), dtype=torch.int32).to(device)
+    # Normalize num_timesteps
+    num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
+    max_timesteps = num_timesteps.max().item()
+
+    # Initialize time series accumulators with shape (1, batch_size)
+    # These will grow to (max_timesteps+1, batch_size) via concatenation
+    interest_paid = torch.zeros((1, batch_size), device=device)
+    principal_paid = torch.zeros((1, batch_size), device=device)
+    balances = loan_amnt.clone().unsqueeze(0)  # (batch_size,) -> (1, batch_size)
+    interest_owed = torch.zeros((1, batch_size), device=device)
+    sim_pymnts = torch.zeros((1, batch_size), device=device)
+    hidden_states = torch.ones((1, batch_size), dtype=torch.int32, device=device)
 
     # Define embeddings as Pyro parameters
     embeddings = pyro.param(
         f"embeddings_{batch_id}", 
-        torch.randn(batch_size, embedding_size).to(device)
+        torch.randn(batch_size, embedding_size, device=device)
     )
     
     # Create and register the neural network module
@@ -138,7 +170,7 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
         tmat = transition_net(embeddings)
     
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
-        for t in range(1, num_timesteps + 1):
+        for t in range(1, max_timesteps + 1):
 
             # Add interest to the balance
             prev_balances = balances[t - 1]
@@ -155,7 +187,7 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
             new_sim_pymnts = torch.where(
                 new_hidden_states < 7,
                 (hidden_states[t - 1] - new_hidden_states + 1) * installments,
-                torch.zeros(batch_size).to(device)
+                torch.zeros(batch_size, device=device)
             )
             
             # Overwrite implied payment with the balance where loan has been fully paid
@@ -179,10 +211,18 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
             principal_paid = torch.cat((principal_paid, principal_payment.unsqueeze(0)), dim=0)
             
         # Observation model (noisy measurement of hidden state)
-        if torch.is_tensor(total_pre_chargeoff):                 
+        if torch.is_tensor(total_pre_chargeoff):
+            # sum only observed timesteps
+            masked_pymnts = _apply_timestep_mask(num_timesteps, max_timesteps, target=sim_pymnts[1:], device=device)
+            predicted_total = masked_pymnts.sum(0)
+
+            # Scale variance by log of number of timesteps (more aggressive than sqrt)
+            base_std = 100. / scaling_factor
+            obs_std = base_std * torch.log(num_timesteps.float())
+            
             pyro.sample(
-                f"obs_{batch_id}_{t}", 
-                dist.Normal(sim_pymnts[1:t].sum(0), 100. / scaling_factor),
+                f"obs_{batch_id}", 
+                dist.Normal(predicted_total, obs_std),
                 obs=total_pre_chargeoff / scaling_factor
             )
 
@@ -195,13 +235,26 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
 
 
 def guide(batch_id, batch_idx, installments, loan_amnt, int_rate, 
-          total_pre_chargeoff, num_timesteps, device='cuda:0'):
+          total_pre_chargeoff, num_timesteps=60, device='cuda:0'):
     """
     Pyro guide (variational posterior) for loan state transitions.
+    
+    Args:
+        batch_id: Identifier for the batch
+        batch_idx: Indices of loans in the batch
+        installments: Monthly installment amounts (batch_size,)
+        loan_amnt: Initial loan amounts (batch_size,)
+        int_rate: Annual interest rates (batch_size,)
+        total_pre_chargeoff: Observed total payments before chargeoff (batch_size,)
+        num_timesteps: Number of observed timesteps per loan (batch_size,)
+        device: Device to run on
     """
     
-    # Determine the shape of the inputs
     batch_size = len(batch_idx)
+    
+    # Normalize num_timesteps (same helper function)
+    num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
+    max_timesteps = num_timesteps.max().item()
 
     # Define the transition matrix prior as a parameter
     tmat_prior = pyro.param(
@@ -211,13 +264,9 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
     )
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
-
-        # Variational posterior for the initial hidden state
-        hidden_states = torch.ones(batch_size, dtype=torch.int32).to(device)
+        hidden_states = torch.ones(batch_size, dtype=torch.int32, device=device)
     
-        for t in range(1, num_timesteps + 1):
-            
-            # Variational posterior for each hidden state
+        for t in range(1, max_timesteps + 1):
             hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
                 dist.Categorical(tmat_prior[batch_idx, hidden_states])
