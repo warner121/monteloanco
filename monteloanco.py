@@ -24,14 +24,14 @@ class Template():
 
     # Define a hand-crafted matrix for demonstration purposes only
     DEMO = torch.tensor([
-            [1.,    0.,    0.,   0.,   0.,   0.,   0.,   0.,  ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-            [0.005, 0.985, 0.01, 0.,   0.,   0.,   0.,   0.,  ],
-            [0.,    0.03,  0.01, 0.96, 0.,   0.,   0.,   0.,  ],
-            [0.,    0.03,  0.,   0.01, 0.96, 0.,   0.,   0.,  ],
-            [0.,    0.03,  0.,   0.,   0.01, 0.96, 0.,   0.,  ],
-            [0.,    0.03,  0.,   0.,   0.,   0.01, 0.96, 0.,  ],
-            [0.,    0.03,  0.,   0.,   0.,   0.,   0.01, 0.96,],
-            [0.,    0.,    0.,   0.,   0.,   0.,   0.,   1.,  ]])
+        [1.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 0.0,],
+        [0.030, 0.960, 0.01, 0.00, 0.00, 0.00, 0.00, 0.0,],
+        [0.025, 0.325, 0.05, 0.60, 0.00, 0.00, 0.00, 0.0,],
+        [0.020, 0.340, 0.00, 0.04, 0.60, 0.00, 0.00, 0.0,],
+        [0.015, 0.355, 0.00, 0.00, 0.03, 0.60, 0.00, 0.0,],
+        [0.010, 0.370, 0.00, 0.00, 0.00, 0.02, 0.60, 0.0,],
+        [0.005, 0.385, 0.00, 0.00, 0.00, 0.00, 0.01, 0.6,],
+        [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0,]])
 
 
 class TransitionMatrixNet(nn.Module):
@@ -107,11 +107,38 @@ def _apply_timestep_mask(num_timesteps, max_timesteps, target, device):
     mask = timestep_range <= num_timesteps.unsqueeze(0)
     
     return target * mask
+
+
+def _extract_last_nonzero_payment(sim_pymnts, num_timesteps, device):
+    """
+    Extract the last non-zero payment for each loan in the batch.
+    
+    Args:
+        sim_pymnts: Tensor of shape (max_timesteps, batch_size) containing payment history
+        num_timesteps: Tensor of shape (batch_size,) indicating number of observed timesteps
+        device: Device to place tensor on
+        
+    Returns:
+        Tensor of shape (batch_size,) containing the last non-zero payment for each loan
+    """
+    batch_size = sim_pymnts.shape[1]
+    max_timesteps = sim_pymnts.shape[0]
+    
+    # Create indices for the last observed timestep for each loan
+    # num_timesteps is 1-indexed, so these are direct indices into sim_pymnts
+    last_indices = num_timesteps.clamp(max=max_timesteps) - 1
+    
+    # Gather the last payment for each loan
+    # sim_pymnts is (max_timesteps, batch_size), we want sim_pymnts[last_indices[i], i]
+    batch_indices = torch.arange(batch_size, device=device)
+    last_payments = sim_pymnts[last_indices, batch_indices]
+    
+    return last_payments
             
 
 def model(batch_id, batch_idx, installments, loan_amnt, int_rate, 
-          total_pre_chargeoff=None, num_timesteps=60, demo=False,
-          embedding_size=3, device='cuda:0', scaling_factor=1_000_000,
+          total_pre_chargeoff=None, last_pymnt_amnt=None, num_timesteps=60, 
+          demo=False, embedding_size=3, device='cuda:0', scaling_factor=1_000_000,
           transition_net=None):
     """
     Pyro model for loan state transitions and payments.
@@ -123,6 +150,7 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
         loan_amnt: Initial loan amounts (batch_size,)
         int_rate: Annual interest rates (batch_size,)
         total_pre_chargeoff: Observed total payments before chargeoff (batch_size,), optional
+        last_pymnt_amnt: Observed last payment amount (batch_size,), optional
         num_timesteps: Number of observed timesteps per loan (batch_size,), optional
         demo: Whether to use demo transition matrix
         embedding_size: Size of loan embeddings
@@ -209,21 +237,37 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
             sim_pymnts = torch.cat((sim_pymnts, new_sim_pymnts.unsqueeze(0)), dim=0)
             interest_paid = torch.cat((interest_paid, interest_payment.unsqueeze(0)), dim=0)
             principal_paid = torch.cat((principal_paid, principal_payment.unsqueeze(0)), dim=0)
-            
+
+        # mask unobserved timesteps
+        masked_pymnts = _apply_timestep_mask(num_timesteps, max_timesteps, target=sim_pymnts[1:], device=device)
+
         # Observation model (noisy measurement of hidden state)
         if torch.is_tensor(total_pre_chargeoff):
-            # sum only observed timesteps
-            masked_pymnts = _apply_timestep_mask(num_timesteps, max_timesteps, target=sim_pymnts[1:], device=device)
             predicted_total = masked_pymnts.sum(0)
 
             # Scale variance by log of number of timesteps (more aggressive than sqrt)
             base_std = 100. / scaling_factor
-            obs_std = base_std * torch.log(num_timesteps.float())
+            total_std = base_std * torch.log(num_timesteps.float())
             
             pyro.sample(
-                f"obs_{batch_id}", 
-                dist.Normal(predicted_total, obs_std),
+                f"obs_total_{batch_id}", 
+                dist.Normal(predicted_total, total_std),
                 obs=total_pre_chargeoff / scaling_factor
+            )
+        
+        # Additional observation for last payment amount
+        if torch.is_tensor(last_pymnt_amnt):
+            predicted_last = masked_pymnts.max(0)[0]
+            
+            # Standard deviation for last payment observation
+            # Could be constant or scaled based on loan characteristics
+            base_std = 50. / scaling_factor
+            last_std = base_std * torch.log(num_timesteps.float())
+            
+            pyro.sample(
+                f"obs_last_{batch_id}",
+                dist.Normal(predicted_last, last_std),
+                obs=last_pymnt_amnt / scaling_factor
             )
 
     return (
@@ -235,7 +279,8 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
 
 
 def guide(batch_id, batch_idx, installments, loan_amnt, int_rate, 
-          total_pre_chargeoff, num_timesteps=60, device='cuda:0'):
+          total_pre_chargeoff, last_pymnt_amnt=None, num_timesteps=60, 
+          device='cuda:0'):
     """
     Pyro guide (variational posterior) for loan state transitions.
     
@@ -246,6 +291,7 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
         loan_amnt: Initial loan amounts (batch_size,)
         int_rate: Annual interest rates (batch_size,)
         total_pre_chargeoff: Observed total payments before chargeoff (batch_size,)
+        last_pymnt_amnt: Observed last payment amount (batch_size,), optional
         num_timesteps: Number of observed timesteps per loan (batch_size,)
         device: Device to run on
     """
@@ -256,11 +302,13 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
     num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
     max_timesteps = num_timesteps.max().item()
 
-    # Define the transition matrix prior as a parameter
-    tmat_prior = pyro.param(
+    # Define the transition matrix prior as a parameter (in logit space)
+    # For Categorical distribution with multiple outcomes, we just need unnormalized log probabilities
+    # Starting from probabilities, we can simply take the log (softmax will renormalize)
+    demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))  # Clamp to avoid log(0)
+    tmat_logits = pyro.param(
         f"tmat_prior_{batch_id}", 
-        Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1).to(device), 
-        constraint=torch.distributions.constraints.positive
+        demo_logits.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
     )
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
@@ -269,5 +317,5 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
         for t in range(1, max_timesteps + 1):
             hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
-                dist.Categorical(tmat_prior[batch_idx, hidden_states])
+                dist.Categorical(logits=tmat_logits[batch_idx, hidden_states])
             )
