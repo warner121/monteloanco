@@ -246,8 +246,8 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
             predicted_total = masked_pymnts.sum(0)
 
             # Scale variance by log of number of timesteps (more aggressive than sqrt)
-            base_std = 100. / scaling_factor
-            total_std = base_std * torch.log(num_timesteps.float())
+            base_std = 50. / scaling_factor
+            total_std = base_std * torch.sqrt(num_timesteps.float())
             
             pyro.sample(
                 f"obs_total_{batch_id}", 
@@ -262,7 +262,7 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
             # Standard deviation for last payment observation
             # Could be constant or scaled based on loan characteristics
             base_std = 50. / scaling_factor
-            last_std = base_std * torch.log(num_timesteps.float())
+            last_std = base_std * torch.sqrt(num_timesteps.float())
             
             pyro.sample(
                 f"obs_last_{batch_id}",
