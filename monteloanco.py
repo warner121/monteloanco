@@ -109,68 +109,182 @@ class Template():
             return Template.logits_to_tmat(tmat_logits, device)
 
 
-def _prepare_num_timesteps(num_timesteps, batch_size, device):
-    """
-    Helper to normalize num_timesteps to a tensor.
+class Portfolio:
+    """Manages batch of loans with vectorized operations"""
     
-    Args:
-        num_timesteps: None or tensor of shape (batch_size,)
-        batch_size: Size of current batch
-        device: Device to place tensor on
+    def __init__(self, batch_idx, loan_amnt, installments, int_rate, 
+                 num_timesteps=60, total_pre_chargeoff=None, 
+                 last_pymnt_amnt=None, device='cuda:0', scaling_factor=1_000_000):
+        """
+        Initialize a portfolio of loans.
         
-    Returns:
-        Tensor of shape (batch_size,) with dtype torch.long
-    """
-    if torch.is_tensor(num_timesteps):
-        num_timesteps = num_timesteps.to(device)
-    else:
-        num_timesteps = torch.full((batch_size,), num_timesteps, dtype=torch.long, device=device)
-
-    return num_timesteps
-
-
-def _apply_timestep_mask(num_timesteps, max_timesteps, target, device):
-    """
-    Helper to mask tensor elements that exeed the bounds of num_timesteps.
-    
-    Args:
-        num_timesteps: Tensor of shape (batch_size,)
-        max_timesteps: Maximum number of timesteps simulated
-        target: Full tensor to which mask is applied
-        device: Device to place tensor on
-    """
-    timestep_range = torch.arange(1, max_timesteps + 1, device=device).unsqueeze(1)
-    mask = timestep_range <= num_timesteps.unsqueeze(0)
-    
-    return target * mask
-
-
-def _extract_last_nonzero_payment(sim_pymnts, num_timesteps, device):
-    """
-    Extract the last non-zero payment for each loan in the batch.
-    
-    Args:
-        sim_pymnts: Tensor of shape (max_timesteps, batch_size) containing payment history
-        num_timesteps: Tensor of shape (batch_size,) indicating number of observed timesteps
-        device: Device to place tensor on
+        Args:
+            batch_idx: Indices of loans in the batch
+            loan_amnt: Initial loan amounts (batch_size,)
+            installments: Monthly installment amounts (batch_size,)
+            int_rate: Annual interest rates (batch_size,)
+            num_timesteps: Number of observed timesteps per loan (batch_size,) or int, optional
+            total_pre_chargeoff: Observed total payments before chargeoff (batch_size,), optional
+            last_pymnt_amnt: Observed last payment amount (batch_size,), optional
+            device: Device to run on
+            scaling_factor: Factor to scale monetary amounts
+        """
+        # Loan characteristics (scaled)
+        self.batch_idx = batch_idx
+        self.batch_size = len(batch_idx)
+        self.loan_amnt = loan_amnt / scaling_factor
+        self.installments = installments / scaling_factor
+        self.int_rate = int_rate
+        self.device = device
+        self.scaling_factor = scaling_factor
         
-    Returns:
-        Tensor of shape (batch_size,) containing the last non-zero payment for each loan
-    """
-    batch_size = sim_pymnts.shape[1]
-    max_timesteps = sim_pymnts.shape[0]
+        # Normalize num_timesteps to tensor
+        if torch.is_tensor(num_timesteps):
+            self.num_timesteps = num_timesteps.to(device)
+        else:
+            self.num_timesteps = torch.full((self.batch_size,), num_timesteps, dtype=torch.long, device=device)
+        
+        self.max_timesteps = self.num_timesteps.max().item()
+        
+        # Observation data (scaled if provided)
+        self.total_pre_chargeoff = total_pre_chargeoff / scaling_factor if torch.is_tensor(total_pre_chargeoff) else None
+        self.last_pymnt_amnt = last_pymnt_amnt / scaling_factor if torch.is_tensor(last_pymnt_amnt) else None
+        
+        # Current state
+        self.current_balances = self.loan_amnt.clone()
+        self.current_interest_owed = torch.zeros(self.batch_size, device=device)
+        self.current_hidden_states = torch.ones(self.batch_size, dtype=torch.int32, device=device)
+        
+        # Histories (start with t=0)
+        self.balances_history = [self.current_balances.clone()]
+        self.interest_paid_history = [torch.zeros(self.batch_size, device=device)]
+        self.principal_paid_history = [torch.zeros(self.batch_size, device=device)]
+        self.payments_history = [torch.zeros(self.batch_size, device=device)]
+        self.hidden_states_history = [self.current_hidden_states.clone()]
     
-    # Create indices for the last observed timestep for each loan
-    # num_timesteps is 1-indexed, so these are direct indices into sim_pymnts
-    last_indices = num_timesteps.clamp(max=max_timesteps) - 1
-    
-    # Gather the last payment for each loan
-    # sim_pymnts is (max_timesteps, batch_size), we want sim_pymnts[last_indices[i], i]
-    batch_indices = torch.arange(batch_size, device=device)
-    last_payments = sim_pymnts[last_indices, batch_indices]
-    
-    return last_payments
+    def _apply_timestep_mask(self, target):
+        """
+        Apply mask to tensor elements that exceed the bounds of num_timesteps.
+        
+        Args:
+            target: Tensor of shape (max_timesteps, batch_size) to mask
             
+        Returns:
+            Masked tensor with same shape
+        """
+        timestep_range = torch.arange(1, self.max_timesteps + 1, device=self.device).unsqueeze(1)
+        mask = timestep_range <= self.num_timesteps.unsqueeze(0)
+        return target * mask
+        
+    def calculate_payment(self, new_hidden_states, old_hidden_states):
+        """
+        Calculate implied payment amount from state transition.
+        
+        Args:
+            new_hidden_states: New hidden states after transition
+            old_hidden_states: Previous hidden states
+            
+        Returns:
+            Tensor of payment amounts (batch_size,)
+        """
+        payment = torch.where(
+            new_hidden_states < 7,
+            (old_hidden_states - new_hidden_states + 1) * self.installments,
+            torch.zeros(self.batch_size, device=self.device)
+        )
+        # Full payoff case
+        payment = torch.where(
+            new_hidden_states == 0,
+            self.current_balances + self.current_interest_owed,
+            payment
+        )
+        return payment
+        
+    def apply_payment(self, payment):
+        """
+        Apply payment to interest first, then principal.
+        
+        Args:
+            payment: Payment amounts (batch_size,)
+            
+        Returns:
+            Tuple of (interest_paid, principal_paid, new_balance)
+        """
+        interest_payment = torch.minimum(payment, self.current_interest_owed)
+        principal_payment = torch.clamp(payment - interest_payment, min=0)
+        new_balance = torch.clamp(self.current_balances - principal_payment, min=0)
+        return interest_payment, principal_payment, new_balance
+        
+    def accrue_interest(self):
+        """Add monthly interest to interest_owed"""
+        self.current_interest_owed += self.current_balances * self.int_rate / 1200
+        
+    def step(self, new_hidden_states):
+        """
+        Execute one timestep given new hidden states (sampled externally by Pyro).
+        Updates internal state and appends to histories.
+        
+        Args:
+            new_hidden_states: New hidden states for this timestep (batch_size,)
+        """
+        # Accrue interest
+        self.accrue_interest()
+        
+        # Calculate payment implied by state transition
+        payment = self.calculate_payment(new_hidden_states, self.current_hidden_states)
+        
+        # Apply payment
+        interest_paid, principal_paid, new_balance = self.apply_payment(payment)
+        
+        # Update current state
+        self.current_balances = new_balance
+        self.current_interest_owed = self.current_interest_owed - interest_paid
+        self.current_hidden_states = new_hidden_states
+        
+        # Append to histories
+        self.balances_history.append(new_balance.clone())
+        self.interest_paid_history.append(interest_paid)
+        self.principal_paid_history.append(principal_paid)
+        self.payments_history.append(payment)
+        self.hidden_states_history.append(new_hidden_states.clone())
+        
+    def get_histories(self):
+        """
+        Return stacked histories (excluding t=0).
+        
+        Returns:
+            Dictionary with keys: hidden_states, payments, interest_paid, principal_paid
+            Each value is a tensor of shape (max_timesteps, batch_size)
+        """
+        return {
+            'hidden_states': torch.stack(self.hidden_states_history[1:]),
+            'payments': torch.stack(self.payments_history[1:]),
+            'interest_paid': torch.stack(self.interest_paid_history[1:]),
+            'principal_paid': torch.stack(self.principal_paid_history[1:])
+        }
+        
+    def get_total_pre_chargeoff(self):
+        """
+        Return total payments with proper masking.
+        
+        Returns:
+            Tensor of total payments (batch_size,)
+        """
+        payments = torch.stack(self.payments_history[1:])
+        masked_payments = self._apply_timestep_mask(payments)
+        return masked_payments.sum(0)
+        
+    def get_last_payment(self):
+        """
+        Return last non-zero payment with proper masking.
+        
+        Returns:
+            Tensor of last payments (batch_size,)
+        """
+        payments = torch.stack(self.payments_history[1:])
+        masked_payments = self._apply_timestep_mask(payments)
+        return masked_payments.max(0)[0]
+
 
 def model(batch_id, batch_idx, installments, loan_amnt, int_rate, 
           total_pre_chargeoff=None, last_pymnt_amnt=None, num_timesteps=60, 
@@ -192,107 +306,57 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
         scaling_factor: Factor to scale monetary amounts
     """
     
-    # Scale inputs
-    installments = installments / scaling_factor
-    loan_amnt = loan_amnt / scaling_factor
-    
-    # Determine shape of batch
     batch_size = len(batch_idx)
     
-    # Normalize num_timesteps
-    num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
-    max_timesteps = num_timesteps.max().item()
-
-    # Initialize time series accumulators with shape (1, batch_size)
-    # These will grow to (max_timesteps+1, batch_size) via concatenation
-    interest_paid = torch.zeros((1, batch_size), device=device)
-    principal_paid = torch.zeros((1, batch_size), device=device)
-    balances = loan_amnt.clone().unsqueeze(0)  # (batch_size,) -> (1, batch_size)
-    interest_owed = torch.zeros((1, batch_size), device=device)
-    sim_pymnts = torch.zeros((1, batch_size), device=device)
-    hidden_states = torch.ones((1, batch_size), dtype=torch.int32, device=device)
-
-    # Get transition matrix logits using Template class
+    # Initialize portfolio
+    portfolio = Portfolio(
+        batch_idx, loan_amnt, installments, int_rate,
+        num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
+        device, scaling_factor
+    )
+    
+    # Get transition matrix logits
     tmat_logits = Template.get_tmat(batch_id, batch_size, demo=demo, device=device)
     
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
-        for t in range(1, max_timesteps + 1):
-
-            # Add interest to the balance
-            prev_balances = balances[t - 1]
-            interest_owed += prev_balances * int_rate / 1200
-            interest_owed = interest_owed.squeeze(0)
-    
-            # Perform the monte-carlo step
+        for t in range(1, portfolio.max_timesteps + 1):
+            # Sample new hidden states
             new_hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
-                dist.Categorical(logits=tmat_logits[batch_idx, hidden_states[t - 1]])
-            )
-               
-            # Calculate the amount that must have been paid to prompt the status update
-            new_sim_pymnts = torch.where(
-                new_hidden_states < 7,
-                (hidden_states[t - 1] - new_hidden_states + 1) * installments,
-                torch.zeros(batch_size, device=device)
+                dist.Categorical(logits=tmat_logits[batch_idx, portfolio.current_hidden_states])
             )
             
-            # Overwrite implied payment with the balance where loan has been fully paid
-            new_sim_pymnts = torch.where(
-                new_hidden_states == 0,
-                prev_balances + interest_owed,
-                new_sim_pymnts
-            )
-
-            # Ensure interest is paid first
-            interest_payment = torch.minimum(new_sim_pymnts, interest_owed)
-            principal_payment = torch.clamp(new_sim_pymnts - interest_payment, min=0)
-            new_balances = torch.clamp(prev_balances - principal_payment, min=0)
-            interest_owed = interest_owed - interest_payment
-            
-            # Append new timestep to histories
-            balances = torch.cat((balances, new_balances.unsqueeze(0)), dim=0)
-            hidden_states = torch.cat((hidden_states, new_hidden_states.unsqueeze(0)), dim=0)
-            sim_pymnts = torch.cat((sim_pymnts, new_sim_pymnts.unsqueeze(0)), dim=0)
-            interest_paid = torch.cat((interest_paid, interest_payment.unsqueeze(0)), dim=0)
-            principal_paid = torch.cat((principal_paid, principal_payment.unsqueeze(0)), dim=0)
-
-        # mask unobserved timesteps
-        masked_pymnts = _apply_timestep_mask(num_timesteps, max_timesteps, target=sim_pymnts[1:], device=device)
-
-        # Observation model (noisy measurement of hidden state)
+            # Update portfolio
+            portfolio.step(new_hidden_states)
+        
+        # Observations
         if torch.is_tensor(total_pre_chargeoff):
-            predicted_total = masked_pymnts.sum(0)
-
-            # Scale variance by log of number of timesteps (more aggressive than sqrt)
+            predicted_total = portfolio.get_total_pre_chargeoff()
             base_std = 50. / scaling_factor
-            total_std = base_std * torch.sqrt(num_timesteps.float())
-            
+            total_std = base_std * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_total_{batch_id}", 
                 dist.Normal(predicted_total, total_std),
                 obs=total_pre_chargeoff / scaling_factor
             )
         
-        # Additional observation for last payment amount
         if torch.is_tensor(last_pymnt_amnt):
-            predicted_last = masked_pymnts.max(0)[0]
-            
-            # Standard deviation for last payment observation
-            # Could be constant or scaled based on loan characteristics
+            predicted_last = portfolio.get_last_payment()
             base_std = 50. / scaling_factor
-            last_std = base_std * torch.sqrt(num_timesteps.float())
-            
+            last_std = base_std * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_last_{batch_id}",
                 dist.Normal(predicted_last, last_std),
                 obs=last_pymnt_amnt / scaling_factor
             )
-
+    
+    # Return scaled histories
+    histories = portfolio.get_histories()
     return (
-        hidden_states[1:], 
-        sim_pymnts[1:] * scaling_factor, 
-        interest_paid[1:] * scaling_factor, 
-        principal_paid[1:] * scaling_factor
+        histories['hidden_states'],
+        histories['payments'] * scaling_factor,
+        histories['interest_paid'] * scaling_factor,
+        histories['principal_paid'] * scaling_factor
     )
 
 
@@ -318,18 +382,22 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
     
     batch_size = len(batch_idx)
     
-    # Normalize num_timesteps (same helper function)
-    num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
-    max_timesteps = num_timesteps.max().item()
+    # Initialize portfolio (for consistent state management)
+    portfolio = Portfolio(
+        batch_idx, loan_amnt, installments, int_rate,
+        num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
+        device, scaling_factor
+    )
 
     # Get transition matrix logits using Template class (aligned with model)
     tmat_logits = Template.get_tmat(batch_id, batch_size, demo=demo, device=device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
-        hidden_states = torch.ones(batch_size, dtype=torch.int32, device=device)
-    
-        for t in range(1, max_timesteps + 1):
-            hidden_states = pyro.sample(
+        for t in range(1, portfolio.max_timesteps + 1):
+            new_hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
-                dist.Categorical(logits=tmat_logits[batch_idx, hidden_states])
+                dist.Categorical(logits=tmat_logits[batch_idx, portfolio.current_hidden_states])
             )
+            
+            # Update portfolio state
+            portfolio.step(new_hidden_states)
