@@ -1,12 +1,6 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
-
-from pyro.nn import PyroModule
-from torch.utils.data import BatchSampler
-from collections import defaultdict
 
 
 class Template:
@@ -42,7 +36,7 @@ class Template:
         Convert probabilities to logits, applying the mask.
         """
         logits = torch.log(probs.clamp(min=1e-8))
-        return logits.masked_fill(Template.MASK, float("-inf"))
+        return logits.masked_fill(Template.MASK.to(logits.device), float("-inf"))
 
     @staticmethod
     def apply_mask(logits: torch.Tensor) -> torch.Tensor:
@@ -71,7 +65,7 @@ class TransitionMatrixProvider:
 
 
 class DemoTransition(TransitionMatrixProvider):
-    def get_logits(self, batch_id, batch_size, device):
+    def get_logits(self, batch_id, batch_idx, batch_size, device):
         return Template.batch_logits(
             Template.DEMO_LOGITS.to(device),
             batch_size
@@ -88,7 +82,7 @@ class ExternalTransition(TransitionMatrixProvider):
     def __init__(self, logits):
         self.logits = logits
 
-    def get_logits(self, batch_id, batch_size, device):
+    def get_logits(self, batch_id, batch_idx, batch_size, device):
         logits = Template.apply_mask(self.logits.to(device))
         if logits.dim() == 2:
             return logits.unsqueeze(0).expand(batch_size, -1, -1)
@@ -105,7 +99,7 @@ class LearnedTransition(TransitionMatrixProvider):
         self.init_logits = init_logits
         self.trainable = trainable
 
-    def get_logits(self, batch_id, batch_size, device):
+    def get_logits(self, batch_id, batch_idx, batch_size, device):
         if self.init_logits is None:
             raise ValueError("init_logits must be provided for learned transitions")
 
@@ -120,20 +114,20 @@ class LearnedTransition(TransitionMatrixProvider):
             logits_flat = logits_flat.detach()
 
         tmat = logits_flat.view(-1, 8, 8)
+        tmat = tmat[batch_idx]
         return Template.apply_mask(tmat)
 
 
 class Portfolio:
     """Manages batch of loans with vectorized operations"""
     
-    def __init__(self, batch_idx, loan_amnt, installments, int_rate, 
+    def __init__(self, loan_amnt, installments, int_rate,
                  num_timesteps=60, total_pre_chargeoff=None, 
                  last_pymnt_amnt=None, device='cuda:0', scaling_factor=1_000_000):
         """
         Initialize a portfolio of loans.
         
         Args:
-            batch_idx: Indices of loans in the batch
             loan_amnt: Initial loan amounts (batch_size,)
             installments: Monthly installment amounts (batch_size,)
             int_rate: Annual interest rates (batch_size,)
@@ -144,8 +138,7 @@ class Portfolio:
             scaling_factor: Factor to scale monetary amounts
         """
         # Loan characteristics (scaled)
-        self.batch_idx = batch_idx
-        self.batch_size = len(batch_idx)
+        self.batch_size = len(loan_amnt)
         self.loan_amnt = loan_amnt / scaling_factor
         self.installments = installments / scaling_factor
         self.int_rate = int_rate
@@ -317,19 +310,19 @@ def model(
     batch_size = len(batch_idx)
 
     portfolio = Portfolio(
-        batch_idx, loan_amnt, installments, int_rate,
+        loan_amnt, installments, int_rate,
         num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
         device, scaling_factor
     )
 
-    tmat_logits = tmat_provider.get_logits(batch_id, batch_size, device)
+    tmat_logits = tmat_provider.get_logits(batch_id, batch_idx, batch_size, device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
                 f"h_{batch_id}_{t}",
-                dist.Categorical(logits=tmat_logits[batch_idx, portfolio.current_hidden_states])
+                dist.Categorical(logits=tmat_logits[torch.arange(batch_size, device=device), portfolio.current_hidden_states])
             )
             portfolio.step(new_hidden_states)
 
@@ -372,19 +365,19 @@ def guide(
     
     # Initialize portfolio (for consistent state management)
     portfolio = Portfolio(
-        batch_idx, loan_amnt, installments, int_rate,
+        loan_amnt, installments, int_rate,
         num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
         device, scaling_factor
     )
 
     # Get transition matrix logits using Template class (aligned with model)
-    tmat_logits = tmat_provider.get_logits(batch_id, batch_size, device)
+    tmat_logits = tmat_provider.get_logits(batch_id, batch_idx, batch_size, device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
                 f"h_{batch_id}_{t}",
-                dist.Categorical(logits=tmat_logits[batch_idx, portfolio.current_hidden_states])
+                dist.Categorical(logits=tmat_logits[torch.arange(batch_size, device=device), portfolio.current_hidden_states])
             )
             
             # Update portfolio state
