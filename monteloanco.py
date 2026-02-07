@@ -9,104 +9,118 @@ from torch.utils.data import BatchSampler
 from collections import defaultdict
 
 
-class Template():
-    
-    # Define a mask for forbidden transitions
-    MASK = torch.tensor([
-        [ False,  True,  True,  True,  True,  True,  True,  True, ], # [full-paid, current, 30 days late, 60 days late, ..., charged-off]
-        [ False, False, False,  True,  True,  True,  True,  True, ],
-        [ False, False, False, False,  True,  True,  True,  True, ],
-        [ False, False, False, False, False,  True,  True,  True, ],
-        [ False, False, False, False, False, False,  True,  True, ],
-        [ False, False, False, False, False, False, False,  True, ],
-        [ False, False, False, False, False, False, False, False, ],
-        [  True,  True,  True,  True,  True,  True,  True, False, ]])
+class Template:
+    """
+    Pyro-agnostic utilities and canonical transition definitions.
+    """
 
-    # Define a hand-crafted matrix for demonstration purposes only
-    DEMO = torch.tensor([
-        [1.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 0.0,],
-        [0.030, 0.960, 0.01, 0.00, 0.00, 0.00, 0.00, 0.0,],
-        [0.025, 0.325, 0.05, 0.60, 0.00, 0.00, 0.00, 0.0,],
-        [0.020, 0.340, 0.00, 0.04, 0.60, 0.00, 0.00, 0.0,],
-        [0.015, 0.355, 0.00, 0.00, 0.03, 0.60, 0.00, 0.0,],
-        [0.010, 0.370, 0.00, 0.00, 0.00, 0.02, 0.60, 0.0,],
-        [0.005, 0.385, 0.00, 0.00, 0.00, 0.00, 0.01, 0.6,],
-        [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0,]])
-    
+    MASK = torch.tensor([
+        [ False,  True,  True,  True,  True,  True,  True,  True ],
+        [ False, False, False,  True,  True,  True,  True,  True ],
+        [ False, False, False, False,  True,  True,  True,  True ],
+        [ False, False, False, False, False,  True,  True,  True ],
+        [ False, False, False, False, False, False,  True,  True ],
+        [ False, False, False, False, False, False, False,  True ],
+        [ False, False, False, False, False, False, False, False ],
+        [  True,  True,  True,  True,  True,  True,  True, False ],
+    ])
+
+    DEMO_PROBS = torch.tensor([
+        [1.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 0.0],
+        [0.030, 0.960, 0.01, 0.00, 0.00, 0.00, 0.00, 0.0],
+        [0.025, 0.325, 0.05, 0.60, 0.00, 0.00, 0.00, 0.0],
+        [0.020, 0.340, 0.00, 0.04, 0.60, 0.00, 0.00, 0.0],
+        [0.015, 0.355, 0.00, 0.00, 0.03, 0.60, 0.00, 0.0],
+        [0.010, 0.370, 0.00, 0.00, 0.00, 0.02, 0.60, 0.0],
+        [0.005, 0.385, 0.00, 0.00, 0.00, 0.00, 0.01, 0.6],
+        [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0],
+    ])
+
     @staticmethod
-    def get_demo_logits(device='cuda:0'):
+    def probs_to_logits(probs: torch.Tensor) -> torch.Tensor:
         """
-        Get initial logits from the demo transition matrix.
-        
-        Args:
-            device: Device to place tensor on
-            
-        Returns:
-            Flattened logits tensor of shape (64,)
+        Convert probabilities to logits, applying the mask.
         """
-        return torch.log(Template.DEMO.clamp(min=1e-8)).flatten().to(device)
-    
+        logits = torch.log(probs.clamp(min=1e-8))
+        return logits.masked_fill(Template.MASK, float("-inf"))
+
     @staticmethod
-    def initialize_tmat_logits(batch_id, batch_size, device='cuda:0'):
+    def apply_mask(logits: torch.Tensor) -> torch.Tensor:
         """
-        Initialize transition matrix logits as a Pyro parameter.
-        
-        Args:
-            batch_id: Identifier for the batch
-            batch_size: Number of loans in batch
-            device: Device to place tensor on
-            
-        Returns:
-            Pyro parameter of shape (batch_size, 64)
+        Apply the canonical mask to logits, automatically matching device.
         """
-        demo_logits = Template.get_demo_logits(device)
-        return pyro.param(
-            f"tmat_logits_{batch_id}", 
-            demo_logits.unsqueeze(0).repeat(batch_size, 1)
+        return logits.masked_fill(Template.MASK.to(logits.device), float("-inf"))
+
+    @staticmethod
+    def batch_logits(logits: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Expand logits to a batch dimension.
+        """
+        return logits.unsqueeze(0).expand(batch_size, -1, -1)
+
+# Compute DEMO_LOGITS after the class is fully defined
+Template.DEMO_LOGITS = Template.probs_to_logits(Template.DEMO_PROBS)
+
+
+class TransitionMatrixProvider:
+    """
+    Abstract interface for supplying transition matrix logits.
+    """
+    def get_logits(self, batch_size, device):
+        raise NotImplementedError
+
+
+class DemoTransition(TransitionMatrixProvider):
+    def get_logits(self, batch_id, batch_size, device):
+        return Template.batch_logits(
+            Template.DEMO_LOGITS.to(device),
+            batch_size
         )
-    
-    @staticmethod
-    def logits_to_tmat(logits, device='cuda:0'):
-        """
-        Transform logits into masked logit matrices for Categorical distribution.
-        
-        Args:
-            logits: Tensor of shape (batch_size, 64) representing flattened 8x8 matrices
-            device: Device to place tensor on
-            
-        Returns:
-            Tensor of shape (batch_size, 8, 8) with forbidden transitions set to -inf
-        """
-        # Reshape to transition matrix format
-        tmat_logits = logits.reshape(-1, 8, 8)
-        
-        # Apply mask for forbidden transitions (set to -inf)
-        mask = Template.MASK.to(device)
-        tmat_logits = tmat_logits.masked_fill(mask, float('-inf'))
-        
-        return tmat_logits
-    
-    @staticmethod
-    def get_tmat(batch_id, batch_size, demo=False, device='cuda:0'):
-        """
-        Get transition matrix logits for the batch.
-        
-        Args:
-            batch_id: Identifier for the batch
-            batch_size: Number of loans in batch
-            demo: Whether to use demo transition matrix
-            device: Device to place tensor on
-            
-        Returns:
-            Tensor of shape (batch_size, 8, 8) representing transition matrix logits
-        """
-        if demo:
-            # Convert demo probabilities to logits
-            demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))
-            return demo_logits.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
-        else:
-            tmat_logits = Template.initialize_tmat_logits(batch_id, batch_size, device)
-            return Template.logits_to_tmat(tmat_logits, device)
+
+
+class ExternalTransition(TransitionMatrixProvider):
+    """
+    logits may be:
+      - (8, 8)
+      - (batch, 8, 8)
+    """
+
+    def __init__(self, logits):
+        self.logits = logits
+
+    def get_logits(self, batch_id, batch_size, device):
+        logits = Template.apply_mask(self.logits.to(device))
+        if logits.dim() == 2:
+            return logits.unsqueeze(0).expand(batch_size, -1, -1)
+        return logits
+
+
+class LearnedTransition(TransitionMatrixProvider):
+    """
+    Shared or per-batch learned transition matrix via pyro.param.
+    """
+
+    def __init__(self, name, init_logits=None, trainable=True):
+        self.name = name
+        self.init_logits = init_logits
+        self.trainable = trainable
+
+    def get_logits(self, batch_id, batch_size, device):
+        if self.init_logits is None:
+            raise ValueError("init_logits must be provided for learned transitions")
+
+        flat_init = self.init_logits.flatten().to(device)
+
+        logits_flat = pyro.param(
+            f"{self.name}_{batch_id}",
+            flat_init.unsqueeze(0).expand(batch_size, -1)
+        )
+
+        if not self.trainable:
+            logits_flat = logits_flat.detach()
+
+        tmat = logits_flat.view(-1, 8, 8)
+        return Template.apply_mask(tmat)
 
 
 class Portfolio:
@@ -258,9 +272,9 @@ class Portfolio:
         """
         return {
             'hidden_states': torch.stack(self.hidden_states_history[1:]),
-            'payments': torch.stack(self.payments_history[1:]),
-            'interest_paid': torch.stack(self.interest_paid_history[1:]),
-            'principal_paid': torch.stack(self.principal_paid_history[1:])
+            'payments': torch.stack(self.payments_history[1:]) * self.scaling_factor,
+            'interest_paid': torch.stack(self.interest_paid_history[1:]) * self.scaling_factor,
+            'principal_paid': torch.stack(self.principal_paid_history[1:]) * self.scaling_factor
         }
         
     def get_total_pre_chargeoff(self):
@@ -286,99 +300,73 @@ class Portfolio:
         return masked_payments.max(0)[0]
 
 
-def model(batch_id, batch_idx, installments, loan_amnt, int_rate, 
-          total_pre_chargeoff=None, last_pymnt_amnt=None, num_timesteps=60, 
-          demo=False, device='cuda:0', scaling_factor=1_000_000):
-    """
-    Pyro model for loan state transitions and payments.
-    
-    Args:
-        batch_id: Identifier for the batch
-        batch_idx: Indices of loans in the batch
-        installments: Monthly installment amounts (batch_size,)
-        loan_amnt: Initial loan amounts (batch_size,)
-        int_rate: Annual interest rates (batch_size,)
-        total_pre_chargeoff: Observed total payments before chargeoff (batch_size,), optional
-        last_pymnt_amnt: Observed last payment amount (batch_size,), optional
-        num_timesteps: Number of observed timesteps per loan (batch_size,), optional
-        demo: Whether to use demo transition matrix
-        device: Device to run on
-        scaling_factor: Factor to scale monetary amounts
-    """
-    
+def model(
+    batch_id,
+    batch_idx,
+    installments,
+    loan_amnt,
+    int_rate,
+    tmat_provider: TransitionMatrixProvider,
+    total_pre_chargeoff=None,
+    last_pymnt_amnt=None,
+    num_timesteps=60,
+    device="cuda:0",
+    scaling_factor=1_000_000,
+):
+
     batch_size = len(batch_idx)
-    
-    # Initialize portfolio
+
     portfolio = Portfolio(
         batch_idx, loan_amnt, installments, int_rate,
         num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
         device, scaling_factor
     )
-    
-    # Get transition matrix logits
-    tmat_logits = Template.get_tmat(batch_id, batch_size, demo=demo, device=device)
-    
+
+    tmat_logits = tmat_provider.get_logits(batch_id, batch_size, device)
+
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
+
         for t in range(1, portfolio.max_timesteps + 1):
-            # Sample new hidden states
             new_hidden_states = pyro.sample(
-                f"hidden_state_{batch_id}_{t}", 
+                f"h_{batch_id}_{t}",
                 dist.Categorical(logits=tmat_logits[batch_idx, portfolio.current_hidden_states])
             )
-            
-            # Update portfolio
             portfolio.step(new_hidden_states)
-        
-        # Observations
+
         if torch.is_tensor(total_pre_chargeoff):
-            predicted_total = portfolio.get_total_pre_chargeoff()
-            base_std = 50. / scaling_factor
-            total_std = base_std * torch.sqrt(portfolio.num_timesteps.float())
+            pred = portfolio.get_total_pre_chargeoff()
+            std = (50. / scaling_factor) * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
-                f"obs_total_{batch_id}", 
-                dist.Normal(predicted_total, total_std),
+                f"obs_total_{batch_id}",
+                dist.Normal(pred, std),
                 obs=total_pre_chargeoff / scaling_factor
             )
-        
+
         if torch.is_tensor(last_pymnt_amnt):
-            predicted_last = portfolio.get_last_payment()
-            base_std = 50. / scaling_factor
-            last_std = base_std * torch.sqrt(portfolio.num_timesteps.float())
+            pred = portfolio.get_last_payment()
+            std = (50. / scaling_factor) * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_last_{batch_id}",
-                dist.Normal(predicted_last, last_std),
+                dist.Normal(pred, std),
                 obs=last_pymnt_amnt / scaling_factor
             )
-    
-    # Return scaled histories
-    histories = portfolio.get_histories()
-    return (
-        histories['hidden_states'],
-        histories['payments'] * scaling_factor,
-        histories['interest_paid'] * scaling_factor,
-        histories['principal_paid'] * scaling_factor
-    )
+
+    return portfolio
 
 
-def guide(batch_id, batch_idx, installments, loan_amnt, int_rate, 
-          total_pre_chargeoff, last_pymnt_amnt=None, num_timesteps=60, 
-          demo=False, device='cuda:0', scaling_factor=1_000_000):
-    """
-    Pyro guide (variational posterior) for loan state transitions.
-    
-    Args:
-        batch_id: Identifier for the batch
-        batch_idx: Indices of loans in the batch
-        installments: Monthly installment amounts (batch_size,)
-        loan_amnt: Initial loan amounts (batch_size,)
-        int_rate: Annual interest rates (batch_size,)
-        total_pre_chargeoff: Observed total payments before chargeoff (batch_size,)
-        last_pymnt_amnt: Observed last payment amount (batch_size,), optional
-        num_timesteps: Number of observed timesteps per loan (batch_size,)
-        demo: Whether to use demo transition matrix
-        device: Device to run on
-        scaling_factor: Factor to scale monetary amounts
-    """
+def guide(
+    batch_id,
+    batch_idx,
+    installments,
+    loan_amnt,
+    int_rate,
+    tmat_provider: TransitionMatrixProvider,
+    total_pre_chargeoff=None,
+    last_pymnt_amnt=None,
+    num_timesteps=60,
+    device="cuda:0",
+    scaling_factor=1_000_000,
+):
     
     batch_size = len(batch_idx)
     
@@ -390,12 +378,12 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
     )
 
     # Get transition matrix logits using Template class (aligned with model)
-    tmat_logits = Template.get_tmat(batch_id, batch_size, demo=demo, device=device)
+    tmat_logits = tmat_provider.get_logits(batch_id, batch_size, device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
-                f"hidden_state_{batch_id}_{t}", 
+                f"h_{batch_id}_{t}",
                 dist.Categorical(logits=tmat_logits[batch_idx, portfolio.current_hidden_states])
             )
             
