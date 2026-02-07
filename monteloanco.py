@@ -34,43 +34,31 @@ class Template():
         [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0,]])
 
 
-class TransitionMatrixNet(nn.Module):
-    """Neural network to generate transition matrices from embeddings."""
+def _logits_to_tmat(logits, mask, device):
+    """
+    Transform logits into transition matrices.
     
-    def __init__(self, embedding_size, device='cuda:0'):
-        super().__init__()
-        self.device = device
-        self.linear1 = nn.Linear(embedding_size, 64)
+    Args:
+        logits: Tensor of shape (batch_size, 64) representing flattened 8x8 matrices
+        mask: Boolean mask for forbidden transitions
+        device: Device to place tensor on
         
-        # Register the mask as a buffer so it moves with the module
-        self.register_buffer('mask', Template.MASK)
-        
-    def forward(self, embeddings):
-        """
-        Transform embeddings into transition matrices.
-        
-        Args:
-            embeddings: Tensor of shape (batch_size, embedding_size)
-            
-        Returns:
-            Tensor of shape (batch_size, 8, 8) representing transition matrices
-        """
-        # Apply linear transformation
-        tmat = self.linear1(embeddings)
-        
-        # Reshape to transition matrix format
-        tmat = tmat.reshape(-1, 8, 8)
-        
-        # Apply mask for forbidden transitions
-        tmat = tmat.masked_fill(self.mask, float('-inf'))
-        
-        # Apply softmax to get valid probability distributions
-        tmat = F.softmax(tmat, dim=-1)
-        
-        # Handle any NaN values
-        tmat = torch.nan_to_num(tmat, nan=0.0)
-        
-        return tmat
+    Returns:
+        Tensor of shape (batch_size, 8, 8) representing transition matrices
+    """
+    # Reshape to transition matrix format
+    tmat = logits.reshape(-1, 8, 8)
+    
+    # Apply mask for forbidden transitions
+    tmat = tmat.masked_fill(mask, float('-inf'))
+    
+    # Apply softmax to get valid probability distributions
+    tmat = F.softmax(tmat, dim=-1)
+    
+    # Handle any NaN values
+    tmat = torch.nan_to_num(tmat, nan=0.0)
+    
+    return tmat
 
 
 def _prepare_num_timesteps(num_timesteps, batch_size, device):
@@ -138,8 +126,7 @@ def _extract_last_nonzero_payment(sim_pymnts, num_timesteps, device):
 
 def model(batch_id, batch_idx, installments, loan_amnt, int_rate, 
           total_pre_chargeoff=None, last_pymnt_amnt=None, num_timesteps=60, 
-          demo=False, embedding_size=3, device='cuda:0', scaling_factor=1_000_000,
-          transition_net=None):
+          demo=False, device='cuda:0', scaling_factor=1_000_000):
     """
     Pyro model for loan state transitions and payments.
     
@@ -153,10 +140,8 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
         last_pymnt_amnt: Observed last payment amount (batch_size,), optional
         num_timesteps: Number of observed timesteps per loan (batch_size,), optional
         demo: Whether to use demo transition matrix
-        embedding_size: Size of loan embeddings
         device: Device to run on
         scaling_factor: Factor to scale monetary amounts
-        transition_net: Neural network for generating transition matrices
     """
     
     # Scale inputs
@@ -179,23 +164,19 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
     sim_pymnts = torch.zeros((1, batch_size), device=device)
     hidden_states = torch.ones((1, batch_size), dtype=torch.int32, device=device)
 
-    # Define embeddings as Pyro parameters
-    embeddings = pyro.param(
-        f"embeddings_{batch_id}", 
-        torch.randn(batch_size, embedding_size, device=device)
-    )
-    
-    # Create and register the neural network module
-    transition_net = pyro.module(
-        f"transition_net",
-        transition_net
+    # Define transition matrix logits directly as Pyro parameters (64d per loan)
+    # Initialize from demo matrix to provide strong prior
+    demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))  # (8, 8)
+    tmat_logits = pyro.param(
+        f"tmat_logits_{batch_id}", 
+        demo_logits.flatten().unsqueeze(0).repeat(batch_size, 1).to(device)  # (batch_size, 64)
     )
     
     # Generate transition matrices
     if demo:
         tmat = Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
     else:
-        tmat = transition_net(embeddings)
+        tmat = _logits_to_tmat(tmat_logits, Template.MASK.to(device), device)
     
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         for t in range(1, max_timesteps + 1):
@@ -302,14 +283,16 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
     num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
     max_timesteps = num_timesteps.max().item()
 
-    # Define the transition matrix prior as a parameter (in logit space)
-    # For Categorical distribution with multiple outcomes, we just need unnormalized log probabilities
-    # Starting from probabilities, we can simply take the log (softmax will renormalize)
-    demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))  # Clamp to avoid log(0)
+    # Define the transition matrix logits as a parameter (shared with model)
+    # This ensures model and guide use the same parameterization
+    demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))
     tmat_logits = pyro.param(
-        f"tmat_prior_{batch_id}", 
-        demo_logits.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        f"tmat_logits_{batch_id}", 
+        demo_logits.flatten().unsqueeze(0).repeat(batch_size, 1).to(device)  # (batch_size, 64)
     )
+    
+    # Reshape logits to get transition probabilities for sampling
+    tmat_logits_reshaped = tmat_logits.view(batch_size, 8, 8)  # (batch_size, 8, 8)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         hidden_states = torch.ones(batch_size, dtype=torch.int32, device=device)
@@ -317,5 +300,5 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
         for t in range(1, max_timesteps + 1):
             hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
-                dist.Categorical(logits=tmat_logits[batch_idx, hidden_states])
+                dist.Categorical(logits=tmat_logits_reshaped[batch_idx, hidden_states])
             )
