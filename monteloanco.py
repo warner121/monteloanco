@@ -32,33 +32,81 @@ class Template():
         [0.010, 0.370, 0.00, 0.00, 0.00, 0.02, 0.60, 0.0,],
         [0.005, 0.385, 0.00, 0.00, 0.00, 0.00, 0.01, 0.6,],
         [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0,]])
-
-
-def _logits_to_tmat(logits, mask, device):
-    """
-    Transform logits into transition matrices.
     
-    Args:
-        logits: Tensor of shape (batch_size, 64) representing flattened 8x8 matrices
-        mask: Boolean mask for forbidden transitions
-        device: Device to place tensor on
+    @staticmethod
+    def get_demo_logits(device='cuda:0'):
+        """
+        Get initial logits from the demo transition matrix.
         
-    Returns:
-        Tensor of shape (batch_size, 8, 8) representing transition matrices
-    """
-    # Reshape to transition matrix format
-    tmat = logits.reshape(-1, 8, 8)
+        Args:
+            device: Device to place tensor on
+            
+        Returns:
+            Flattened logits tensor of shape (64,)
+        """
+        return torch.log(Template.DEMO.clamp(min=1e-8)).flatten().to(device)
     
-    # Apply mask for forbidden transitions
-    tmat = tmat.masked_fill(mask, float('-inf'))
+    @staticmethod
+    def initialize_tmat_logits(batch_id, batch_size, device='cuda:0'):
+        """
+        Initialize transition matrix logits as a Pyro parameter.
+        
+        Args:
+            batch_id: Identifier for the batch
+            batch_size: Number of loans in batch
+            device: Device to place tensor on
+            
+        Returns:
+            Pyro parameter of shape (batch_size, 64)
+        """
+        demo_logits = Template.get_demo_logits(device)
+        return pyro.param(
+            f"tmat_logits_{batch_id}", 
+            demo_logits.unsqueeze(0).repeat(batch_size, 1)
+        )
     
-    # Apply softmax to get valid probability distributions
-    tmat = F.softmax(tmat, dim=-1)
+    @staticmethod
+    def logits_to_tmat(logits, device='cuda:0'):
+        """
+        Transform logits into masked logit matrices for Categorical distribution.
+        
+        Args:
+            logits: Tensor of shape (batch_size, 64) representing flattened 8x8 matrices
+            device: Device to place tensor on
+            
+        Returns:
+            Tensor of shape (batch_size, 8, 8) with forbidden transitions set to -inf
+        """
+        # Reshape to transition matrix format
+        tmat_logits = logits.reshape(-1, 8, 8)
+        
+        # Apply mask for forbidden transitions (set to -inf)
+        mask = Template.MASK.to(device)
+        tmat_logits = tmat_logits.masked_fill(mask, float('-inf'))
+        
+        return tmat_logits
     
-    # Handle any NaN values
-    tmat = torch.nan_to_num(tmat, nan=0.0)
-    
-    return tmat
+    @staticmethod
+    def get_tmat(batch_id, batch_size, demo=False, device='cuda:0'):
+        """
+        Get transition matrix logits for the batch.
+        
+        Args:
+            batch_id: Identifier for the batch
+            batch_size: Number of loans in batch
+            demo: Whether to use demo transition matrix
+            device: Device to place tensor on
+            
+        Returns:
+            Tensor of shape (batch_size, 8, 8) representing transition matrix logits
+        """
+        if demo:
+            # Convert demo probabilities to logits
+            demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))
+            return demo_logits.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        else:
+            tmat_logits = Template.initialize_tmat_logits(batch_id, batch_size, device)
+            return Template.logits_to_tmat(tmat_logits, device)
 
 
 def _prepare_num_timesteps(num_timesteps, batch_size, device):
@@ -164,19 +212,8 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
     sim_pymnts = torch.zeros((1, batch_size), device=device)
     hidden_states = torch.ones((1, batch_size), dtype=torch.int32, device=device)
 
-    # Define transition matrix logits directly as Pyro parameters (64d per loan)
-    # Initialize from demo matrix to provide strong prior
-    demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))  # (8, 8)
-    tmat_logits = pyro.param(
-        f"tmat_logits_{batch_id}", 
-        demo_logits.flatten().unsqueeze(0).repeat(batch_size, 1).to(device)  # (batch_size, 64)
-    )
-    
-    # Generate transition matrices
-    if demo:
-        tmat = Template.DEMO.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
-    else:
-        tmat = _logits_to_tmat(tmat_logits, Template.MASK.to(device), device)
+    # Get transition matrix logits using Template class
+    tmat_logits = Template.get_tmat(batch_id, batch_size, demo=demo, device=device)
     
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         for t in range(1, max_timesteps + 1):
@@ -189,7 +226,7 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
             # Perform the monte-carlo step
             new_hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
-                dist.Categorical(tmat[batch_idx, hidden_states[t - 1]])
+                dist.Categorical(logits=tmat_logits[batch_idx, hidden_states[t - 1]])
             )
                
             # Calculate the amount that must have been paid to prompt the status update
@@ -261,7 +298,7 @@ def model(batch_id, batch_idx, installments, loan_amnt, int_rate,
 
 def guide(batch_id, batch_idx, installments, loan_amnt, int_rate, 
           total_pre_chargeoff, last_pymnt_amnt=None, num_timesteps=60, 
-          device='cuda:0'):
+          demo=False, device='cuda:0', scaling_factor=1_000_000):
     """
     Pyro guide (variational posterior) for loan state transitions.
     
@@ -274,7 +311,9 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
         total_pre_chargeoff: Observed total payments before chargeoff (batch_size,)
         last_pymnt_amnt: Observed last payment amount (batch_size,), optional
         num_timesteps: Number of observed timesteps per loan (batch_size,)
+        demo: Whether to use demo transition matrix
         device: Device to run on
+        scaling_factor: Factor to scale monetary amounts
     """
     
     batch_size = len(batch_idx)
@@ -283,16 +322,8 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
     num_timesteps = _prepare_num_timesteps(num_timesteps, batch_size, device)
     max_timesteps = num_timesteps.max().item()
 
-    # Define the transition matrix logits as a parameter (shared with model)
-    # This ensures model and guide use the same parameterization
-    demo_logits = torch.log(Template.DEMO.clamp(min=1e-8))
-    tmat_logits = pyro.param(
-        f"tmat_logits_{batch_id}", 
-        demo_logits.flatten().unsqueeze(0).repeat(batch_size, 1).to(device)  # (batch_size, 64)
-    )
-    
-    # Reshape logits to get transition probabilities for sampling
-    tmat_logits_reshaped = tmat_logits.view(batch_size, 8, 8)  # (batch_size, 8, 8)
+    # Get transition matrix logits using Template class (aligned with model)
+    tmat_logits = Template.get_tmat(batch_id, batch_size, demo=demo, device=device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         hidden_states = torch.ones(batch_size, dtype=torch.int32, device=device)
@@ -300,5 +331,5 @@ def guide(batch_id, batch_idx, installments, loan_amnt, int_rate,
         for t in range(1, max_timesteps + 1):
             hidden_states = pyro.sample(
                 f"hidden_state_{batch_id}_{t}", 
-                dist.Categorical(logits=tmat_logits_reshaped[batch_idx, hidden_states])
+                dist.Categorical(logits=tmat_logits[batch_idx, hidden_states])
             )
