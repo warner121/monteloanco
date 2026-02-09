@@ -65,7 +65,7 @@ class TransitionMatrixProvider:
 
 
 class DemoTransition(TransitionMatrixProvider):
-    def get_logits(self, batch_id, batch_idx, batch_size, device, is_guide=False):
+    def get_logits(self, batch_id, batch_idx, batch_size, device, num_timesteps=None, is_guide=False):
         return Template.batch_logits(
             Template.DEMO_LOGITS.to(device),
             batch_size
@@ -82,7 +82,7 @@ class ExternalTransition(TransitionMatrixProvider):
     def __init__(self, logits):
         self.logits = logits
 
-    def get_logits(self, batch_id, batch_idx, batch_size, device, is_guide=False):
+    def get_logits(self, batch_id, batch_idx, batch_size, device, num_timesteps=None, is_guide=False):
         logits = Template.apply_mask(self.logits.to(device))
         if logits.dim() == 2:
             return logits.unsqueeze(0).expand(batch_size, -1, -1)
@@ -91,13 +91,18 @@ class ExternalTransition(TransitionMatrixProvider):
 
 class LearnedTransition(TransitionMatrixProvider):
     """
-    Hierarchical Bayesian learned transition matrix.
-    Uses global baseline + loan-level stochastic offsets.
+    Hierarchical Bayesian learned transition matrix with deterministic global baseline.
+    Uses fixed global logits + loan-level stochastic offsets scaled by exposure.
     
     Structure:
-        global_logits ~ Normal(init_logits_unmasked, offset_scale)
-        loan_offsets[i] ~ Normal(0, offset_scale)
+        global_logits = pyro.param (deterministic, no uncertainty)
+        loan_offsets[i] ~ Normal(0, offset_scale * sqrt(T_i))
         final_logits[i] = global_logits + loan_offsets[i]
+    
+    Where T_i is the number of observed timesteps for loan i.
+    This creates adaptive regularization based on data availability:
+        - Long loans (high T_i) → loose prior → larger offsets allowed
+        - Short loans (low T_i) → tight prior → small offsets
     """
 
     def __init__(self, name, init_logits=None, trainable=True, offset_scale=0.1, total_size=None):
@@ -117,46 +122,31 @@ class LearnedTransition(TransitionMatrixProvider):
     
     def sample_global(self, device, is_guide=False):
         """
-        Sample global transition matrix (called once per SVI step, outside plate context).
+        Get global transition matrix as a deterministic parameter (no sampling).
+        Called once per SVI step, outside plate context.
         """
         flat_init = self.init_logits_unmasked.flatten().to(device).detach()
         n_logits = len(flat_init)
         
-        if is_guide:
-            # Variational posterior
-            global_loc_q = pyro.param(
-                f"{self.name}_global_loc_q",
-                flat_init.clone()
-            )
-            global_scale_q = pyro.param(
-                f"{self.name}_global_scale_q",
-                0.1 * torch.ones(n_logits, device=device),
-                constraint=dist.constraints.positive
-            )
-            
-            self._global_logits_cache = pyro.sample(
-                f"{self.name}_global",
-                dist.Normal(global_loc_q, global_scale_q).to_event(1)
-            )
-        else:
-            # Prior
-            self._global_logits_cache = pyro.sample(
-                f"{self.name}_global",
-                dist.Normal(
-                    flat_init,
-                    self.offset_scale * torch.ones(n_logits, device=device)
-                ).to_event(1)
-            )
+        # Global logits are now deterministic - just a regular parameter
+        self._global_logits_cache = pyro.param(
+            f"{self.name}_global_logits",
+            flat_init.clone()
+        )
         
         if not self.trainable:
             self._global_logits_cache = self._global_logits_cache.detach()
         
         return self._global_logits_cache
 
-    def get_logits(self, batch_id, batch_idx, batch_size, device, is_guide=False):
+    def get_logits(self, batch_id, batch_idx, batch_size, device, num_timesteps=None, is_guide=False):
         """
         Sample loan-level offsets and combine with global baseline.
         Must be called inside plate context after sample_global().
+        
+        Args:
+            num_timesteps: Number of observed timesteps per loan (batch_size,)
+                          Used to scale offset prior: longer loans → looser prior
         """
         n_logits = len(self._global_logits_cache)
         
@@ -169,21 +159,22 @@ class LearnedTransition(TransitionMatrixProvider):
             )
             offset_scale_q_all = pyro.param(
                 f"{self.name}_offset_scale_q",
-                0.1 * torch.ones(self.total_size, n_logits, device=device),
+                1e-4 * torch.ones(self.total_size, n_logits, device=device),
                 constraint=dist.constraints.positive
             )
-            
             loan_offsets_flat = pyro.sample(
                 f"{self.name}_offsets",
                 dist.Normal(offset_loc_q_all[batch_idx], offset_scale_q_all[batch_idx]).to_event(1)
             )
         else:
-            # Prior
+            # Prior with exposure scaling: σ * sqrt(T_i)
+            # Long loans (high T) → loose prior, Short loans (low T) → tight prior
+            scale = self.offset_scale * torch.sqrt(num_timesteps.float())
             loan_offsets_flat = pyro.sample(
                 f"{self.name}_offsets",
                 dist.Normal(
                     torch.zeros(n_logits, device=device),
-                    self.offset_scale * torch.ones(n_logits, device=device)
+                    scale.unsqueeze(-1)
                 ).to_event(1)
             )
 
@@ -402,7 +393,12 @@ def model(
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         
         # Get transition logits (this will sample loan-level offsets inside the plate context)
-        tmat_logits = tmat_provider.get_logits(batch_id, batch_idx, batch_size, device, is_guide=False)
+        # Pass num_timesteps to scale offset prior by exposure
+        tmat_logits = tmat_provider.get_logits(
+            batch_id, batch_idx, batch_size, device, 
+            num_timesteps=portfolio.num_timesteps,
+            is_guide=False
+        )
 
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
@@ -462,7 +458,12 @@ def guide(
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
         
         # Get transition matrix logits - sample from variational posterior
-        tmat_logits = tmat_provider.get_logits(batch_id, batch_idx, batch_size, device, is_guide=True)
+        # Pass num_timesteps to scale offset posterior by exposure
+        tmat_logits = tmat_provider.get_logits(
+            batch_id, batch_idx, batch_size, device,
+            num_timesteps=portfolio.num_timesteps,
+            is_guide=True
+        )
         
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
