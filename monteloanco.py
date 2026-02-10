@@ -409,7 +409,7 @@ def model(
 
         if torch.is_tensor(total_pre_chargeoff):
             pred = portfolio.get_total_pre_chargeoff()
-            std = (50. / scaling_factor) * torch.sqrt(portfolio.num_timesteps.float())
+            std = 100. / scaling_factor
             pyro.sample(
                 f"obs_total_{batch_id}",
                 dist.Normal(pred, std),
@@ -418,7 +418,7 @@ def model(
 
         if torch.is_tensor(last_pymnt_amnt):
             pred = portfolio.get_last_payment()
-            std = (50. / scaling_factor) * torch.sqrt(portfolio.num_timesteps.float())
+            std = 100. / scaling_factor
             pyro.sample(
                 f"obs_last_{batch_id}",
                 dist.Normal(pred, std),
