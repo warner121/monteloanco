@@ -107,33 +107,6 @@ def _apply_timestep_mask(num_timesteps, max_timesteps, target, device):
     mask = timestep_range <= num_timesteps.unsqueeze(0)
     
     return target * mask
-
-
-def _extract_last_nonzero_payment(sim_pymnts, num_timesteps, device):
-    """
-    Extract the last non-zero payment for each loan in the batch.
-    
-    Args:
-        sim_pymnts: Tensor of shape (max_timesteps, batch_size) containing payment history
-        num_timesteps: Tensor of shape (batch_size,) indicating number of observed timesteps
-        device: Device to place tensor on
-        
-    Returns:
-        Tensor of shape (batch_size,) containing the last non-zero payment for each loan
-    """
-    batch_size = sim_pymnts.shape[1]
-    max_timesteps = sim_pymnts.shape[0]
-    
-    # Create indices for the last observed timestep for each loan
-    # num_timesteps is 1-indexed, so these are direct indices into sim_pymnts
-    last_indices = num_timesteps.clamp(max=max_timesteps) - 1
-    
-    # Gather the last payment for each loan
-    # sim_pymnts is (max_timesteps, batch_size), we want sim_pymnts[last_indices[i], i]
-    batch_indices = torch.arange(batch_size, device=device)
-    last_payments = sim_pymnts[last_indices, batch_indices]
-    
-    return last_payments
             
 
 def model(batch_id, batch_idx, installments, loan_amnt, int_rate, 
