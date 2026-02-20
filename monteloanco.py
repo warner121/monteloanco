@@ -5,7 +5,13 @@ import pyro.distributions as dist
 
 class Template:
     """
-    Pyro-agnostic utilities and canonical transition definitions.
+    Structural constants and utility operations for the 8-state Markov chain.
+
+    States 0–7 encode loan performance buckets (e.g. prepaid, current, DPD bands,
+    default).  The MASK encodes structurally forbidden transitions — entries set to
+    True are clamped to -inf in logit space so the Categorical sampler assigns them
+    zero probability.  DEMO_PROBS is the portfolio-level prior transition matrix,
+    elicited from domain knowledge and used to initialise the global logit parameter.
     """
 
     MASK = torch.tensor([
@@ -39,131 +45,133 @@ class Template:
     def apply_mask(logits: torch.Tensor) -> torch.Tensor:
         return logits.masked_fill(Template.MASK.to(logits.device), float("-inf"))
 
-    @staticmethod
-    def batch_logits(logits: torch.Tensor, batch_size: int) -> torch.Tensor:
-        return logits.unsqueeze(0).expand(batch_size, -1, -1)
-
-# Compute DEMO_LOGITS after the class is fully defined
+# Pre-compute the log-probability form of the prior transition matrix.
 Template.DEMO_LOGITS = Template.probs_to_logits(Template.DEMO_PROBS)
 
 
-class TransitionMatrixProvider:
+# ── Parameter helpers ─────────────────────────────────────────────────────────
+#
+# Parameter registration is split across three functions so that each layer can
+# be called independently — including from outside model()/guide() for inspection
+# or simulation after training.
+#
+# Call order within a training step:
+#
+#   global_logits, sigma_obs = register_global_params(...)   # outside plate
+#   alpha_loc, alpha_scale   = register_loan_params(...)     # outside plate
+#   with pyro.plate(...):
+#       loan_offsets = pyro.sample("alpha_...", ...)         # inside plate
+#       tmat_logits  = build_tmat_logits(...)                # inside plate
+#       ...
+#
+# All three functions are idempotent: pyro.param returns the existing tensor if
+# the name is already in the param store, so repeated calls within the same SVI
+# step are safe.
+
+
+def register_global_params(batch_id: str, device: str, scaling_factor: float):
     """
-    Abstract interface for supplying transition matrix logits.
+    Register and return the portfolio-level parameters shared across all loans.
+
+    Parameters
+    ----------
+    batch_id       : string prefix for all Pyro site names in this batch.
+    device         : torch device string.
+    scaling_factor : monetary divisor; initialises sigma_obs at a realistic value.
+
+    Returns
+    -------
+    global_logits : (8, 8) — portfolio-level transition logit matrix Θ_global.
+                    Initialised from DEMO_LOGITS; unconstrained thereafter.
+                    Mask is applied at use-time so all permitted entries are free.
+    sigma_obs     : scalar — homoskedastic observation noise.  Positive-constrained.
     """
-    def get_logits(self, batch_size, device):
-        raise NotImplementedError
+    global_logits = pyro.param(
+        f"{batch_id}_global_logits",
+        Template.DEMO_LOGITS.to(device).clone(),
+    )   # (8, 8)
+
+    sigma_obs = pyro.param(
+        f"{batch_id}_sigma_obs",
+        torch.tensor(50. / scaling_factor, device=device),
+        constraint=dist.constraints.positive,
+    )   # scalar
+
+    return global_logits, sigma_obs
 
 
-class DemoTransition(TransitionMatrixProvider):
-    def get_logits(self, batch_id, batch_idx, batch_size, device):
-        return Template.batch_logits(
-            Template.DEMO_LOGITS.to(device),
-            batch_size
-        ), None
-
-
-class ExternalTransition(TransitionMatrixProvider):
+def register_loan_params(batch_id: str, batch_idx: torch.Tensor,
+                         total_size: int, device: str):
     """
-    logits may be:
-      - (8, 8)
-      - (batch, 8, 8)
+    Register the full-dataset variational parameter tables and return the rows
+    corresponding to the current batch.
+
+    The tables are indexed by loan position in the full dataset.  Only the rows
+    for batch_idx are returned; gradients flow back to those rows only.
+
+    Parameters
+    ----------
+    batch_id   : string prefix for Pyro site names.
+    batch_idx  : 1-D integer tensor of loan indices into the full dataset,
+                 shape (batch_size,).
+    total_size : total number of distinct loans in the dataset.
+    device     : torch device string.
+
+    Returns
+    -------
+    alpha_loc   : (batch_size, 8, 8) — variational mean for each loan's offset α_i.
+                  Initialised at zero (prior mean).
+    alpha_scale : (batch_size, 8, 8) — variational std for each loan's offset α_i.
+                  Positive-constrained; initialised small for numerical stability.
     """
+    alpha_loc_all = pyro.param(
+        f"{batch_id}_alpha_loc",
+        torch.zeros(total_size, 8, 8, device=device),
+    )   # (total_size, 8, 8)
 
-    def __init__(self, logits):
-        self.logits = logits
+    alpha_scale_all = pyro.param(
+        f"{batch_id}_alpha_scale",
+        torch.full((total_size, 8, 8), 0.1, device=device),
+        constraint=dist.constraints.positive,
+    )   # (total_size, 8, 8)
 
-    def get_logits(self, batch_id, batch_idx, batch_size, device):
-        logits = Template.apply_mask(self.logits.to(device))
-        if logits.dim() == 2:
-            return logits.unsqueeze(0).expand(batch_size, -1, -1), None
-        return logits, None
+    return alpha_loc_all[batch_idx], alpha_scale_all[batch_idx]
 
 
-class LearnedTransition(TransitionMatrixProvider):
+def build_tmat_logits(baseline_logits: torch.Tensor,
+                      loan_offsets: torch.Tensor):
     """
-    Learned transition matrix with optional per-loan heterogeneity.
+    Construct per-loan transition logits from the shared baseline and sampled
+    per-loan offsets.  Pure tensor arithmetic — no Pyro calls — so this can be
+    called freely outside model()/guide() given a baseline and offsets.
 
-    Two uncertainty modes (set via `uncertainty`):
+    Parameters
+    ----------
+    baseline_logits : (8, 8) — mask(Θ_global), the portfolio-level logit matrix.
+    loan_offsets    : (batch_size, 8, 8) — sampled or posterior-mean per-loan
+                      offsets α_i.
 
-    'none'  — identical to the original deterministic version.
-              One shared param per batch_id, no per-loan variation.
-
-    'loan'  — deterministic per-loan logit offsets stored as a pyro.param
-              (total_size, 64).  No stochastic latents → clean gradients,
-              but each loan gets its own adjustment around the shared baseline.
-              Requires total_size to be set.
-
-    In both modes the observation-level std is a learned scalar param
-    (obs_log_std), so the Normal likelihoods can adapt their noise level
-    during training — this is where the primary "uncertainty" lives.
+    Returns
+    -------
+    tmat_logits : (batch_size, 8, 8) — structurally masked per-loan logits,
+                  ready for Categorical sampling or softmax inspection.
     """
+    return Template.apply_mask(
+        baseline_logits.unsqueeze(0) + loan_offsets
+    )   # (batch_size, 8, 8)
 
-    def __init__(self, name, init_logits=None, trainable=True,
-                 uncertainty='loan', total_size=None, prior_strength=1.0):
-        """
-        Args:
-            name:           Unique name for pyro params.
-            init_logits:    (8,8) initial logits (masked inf values are reset to 0).
-            trainable:      If False, all params are detached (frozen).
-            uncertainty:    'none' or 'loan'  (see class docstring).
-            total_size:     Total number of loans in the dataset.
-                            Required when uncertainty='loan'.
-            prior_strength: Scale of the L2 regularisation on per-loan offsets.
-                            Larger values pull short-history loans harder toward
-                            the shared baseline.  Tune in [0.1, 10.0].
-                            Has no effect when uncertainty='none'.
-        """
-        assert uncertainty in ('none', 'loan'), \
-            "uncertainty must be 'none' or 'loan'"
-        self.name = name
-        self.trainable = trainable
-        self.uncertainty = uncertainty
-        self.total_size = total_size
-        self.prior_strength = prior_strength
 
-        if init_logits is not None:
-            init = init_logits.clone()
-            init[torch.isinf(init)] = 0.0
-            self.init_logits_unmasked = init
-        else:
-            self.init_logits_unmasked = None
-
-    def get_logits(self, batch_id, batch_idx, batch_size, device):
-        if self.init_logits_unmasked is None:
-            raise ValueError("init_logits must be provided for LearnedTransition")
-        if self.total_size is None:
-            raise ValueError("total_size must be set for LearnedTransition")
-
-        flat_init = self.init_logits_unmasked.flatten().to(device)
-
-        # ── Shared baseline: fixed prior, not trainable. ───────────────────────
-        # init_logits are broadcast to all loans but held constant — the only
-        # trainable signal comes from per-loan offsets below.
-        baseline_all = flat_init.unsqueeze(0).expand(self.total_size, -1)  # (total_size, 64)
-
-        logits_flat = baseline_all[batch_idx]   # (batch_size, 64) always correct
-
-        # ── Per-loan deterministic offsets (optional) ──────────────────────────
-        if self.uncertainty == 'loan':
-            offsets_all = pyro.param(
-                f"{self.name}_loan_offsets",
-                torch.zeros(self.total_size, flat_init.shape[0], device=device)
-            )
-            if not self.trainable:
-                offsets_all = offsets_all.detach()
-
-            batch_offsets = offsets_all[batch_idx]   # (batch_size, 64)
-            logits_flat = logits_flat + batch_offsets
-        else:
-            batch_offsets = None
-
-        tmat = logits_flat.view(-1, 8, 8)
-        return Template.apply_mask(tmat), batch_offsets
-
+# ── Cashflow simulator ────────────────────────────────────────────────────────
 
 class Portfolio:
-    """Manages batch of loans with vectorized operations"""
+    """
+    Vectorised cashflow simulator for a batch of loans evolving under a
+    discrete-time Markov chain over the 8-state delinquency lattice.
+
+    At each timestep the hidden state determines the payment fraction collected;
+    the Portfolio object accumulates payment histories for downstream likelihood
+    evaluation.
+    """
 
     def __init__(self, loan_amnt, installments, int_rate,
                  num_timesteps=60, total_pre_chargeoff=None,
@@ -256,113 +264,180 @@ class Portfolio:
         return self._apply_timestep_mask(payments).max(0)[0]
 
 
+# ── Model and guide ───────────────────────────────────────────────────────────
+#
+# Both functions have identical signatures.  The structure in each is:
+#
+#   1. register_global_params()  — Θ_global, σ_obs           (outside plate)
+#   2. register_loan_params()    — alpha_loc, alpha_scale     (outside plate)
+#   3. pyro.plate:
+#        a. pyro.sample alpha    — loan offsets α_i           (inside plate)
+#        b. build_tmat_logits()  — pure tensor op             (inside plate)
+#        c. Markov chain loop                                  (inside plate)
+#        d. observation sites                                  (inside plate)
+
 def model(
     batch_id,
     batch_idx,
     installments,
     loan_amnt,
     int_rate,
-    tmat_provider: TransitionMatrixProvider,
+    total_size,
     total_pre_chargeoff=None,
     last_pymnt_amnt=None,
     num_timesteps=60,
     device="cuda:0",
     scaling_factor=1_000_000,
 ):
+    """
+    Generative model for a batch of loans.
+
+    Per-loan transition logits are:
+        θ_i  =  mask(Θ_global + α_i)
+
+    Θ_global is the learned portfolio-level matrix; α_i is a stochastic per-loan
+    offset drawn from an exposure-scaled Normal prior:
+
+        α_i  ~  Normal(0, σ_global / sqrt(T_i))
+
+    where T_i is the number of observed timesteps for loan i (clamped to 1).
+    Loans with short histories have wide priors and stay close to Θ_global;
+    loans with long histories are effectively pinned by their own data.
+
+    Observation likelihood (when targets are provided):
+        total_pre_chargeoff  ~  Normal(simulated_total,  σ_obs)
+        last_pymnt_amnt      ~  Normal(simulated_last,   σ_obs)
+    """
     batch_size = len(batch_idx)
 
     portfolio = Portfolio(
         loan_amnt, installments, int_rate,
         num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
-        device, scaling_factor
+        device, scaling_factor,
     )
 
-    tmat_logits, loan_offsets = tmat_provider.get_logits(batch_id, batch_idx, batch_size, device)
+    # ── Global params (outside plate) ────────────────────────────────────────
+    global_logits, sigma_obs = register_global_params(batch_id, device, scaling_factor)
+    baseline_logits = Template.apply_mask(global_logits)   # (8, 8)
 
-    # ── Learned observation noise: one scalar std per dataset, trained via SVI ──
-    # log-parameterised so it's always positive; init ~50 / scaling_factor
-    obs_std = pyro.param(
-        f"obs_log_std_{batch_id}",
-        torch.tensor((50. / scaling_factor)).log().to(device)
-    ).exp()
+    sigma_global = pyro.param(
+        f"{batch_id}_sigma_global",
+        torch.tensor(0.5, device=device),
+        constraint=dist.constraints.positive,
+    )
+
+    # Exposure-scaled prior std: wide for short histories, narrow for long.
+    T = portfolio.num_timesteps.float().clamp(min=1)                  # (batch_size,)
+    prior_std = (sigma_global / T.sqrt()).view(-1, 1, 1).expand(batch_size, 8, 8)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
-        # ── Exposure-weighted L2 prior on per-loan offsets ─────────────────────
-        # Penalty = -prior_strength * sum(offsets^2) / T_i
-        # Short loans (low T) → large penalty → pulled toward shared baseline.
-        # Long loans (high T) → small penalty → free to specialise.
-        if loan_offsets is not None:
-            inv_T = 1.0 / portfolio.num_timesteps.float().clamp(min=1)  # (batch,)
-            l2 = (loan_offsets ** 2).sum(-1)                            # (batch,)
-            pyro.factor(
-                f"offset_prior_{batch_id}",
-                -tmat_provider.prior_strength * inv_T * l2
-            )
+        # α_i ~ Normal(0, σ_global / sqrt(T_i))
+        # to_event(2) declares (8, 8) as the event shape; the plate dim is loans.
+        loan_offsets = pyro.sample(
+            f"alpha_{batch_id}",
+            dist.Normal(
+                torch.zeros(batch_size, 8, 8, device=device),
+                prior_std,
+            ).to_event(2)
+        )   # (batch_size, 8, 8)
+
+        tmat_logits = build_tmat_logits(baseline_logits, loan_offsets)
 
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
                 f"h_{batch_id}_{t}",
                 dist.Categorical(logits=tmat_logits[
                     torch.arange(batch_size, device=device),
-                    portfolio.current_hidden_states
+                    portfolio.current_hidden_states,
                 ])
             )
             portfolio.step(new_hidden_states)
 
         if torch.is_tensor(total_pre_chargeoff):
             pred = portfolio.get_total_pre_chargeoff()
-            # Scale std by sqrt(T) so longer loans get proportionally wider likelihood
-            std = obs_std * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_total_{batch_id}",
-                dist.Normal(pred, std),
-                obs=total_pre_chargeoff / scaling_factor
+                dist.Normal(pred, sigma_obs),
+                obs=total_pre_chargeoff / scaling_factor,
             )
 
         if torch.is_tensor(last_pymnt_amnt):
             pred = portfolio.get_last_payment()
-            std = obs_std * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_last_{batch_id}",
-                dist.Normal(pred, std),
-                obs=last_pymnt_amnt / scaling_factor
+                dist.Normal(pred, sigma_obs),
+                obs=last_pymnt_amnt / scaling_factor,
             )
 
     return portfolio
 
 
-# Guide is identical to deterministic original — no stochastic latents to approximate.
 def guide(
     batch_id,
     batch_idx,
     installments,
     loan_amnt,
     int_rate,
-    tmat_provider: TransitionMatrixProvider,
+    total_size,
     total_pre_chargeoff=None,
     last_pymnt_amnt=None,
     num_timesteps=60,
     device="cuda:0",
     scaling_factor=1_000_000,
 ):
+    """
+    Variational guide for model().
+
+    Deterministic parameters (Θ_global, σ_global, σ_obs) are registered via
+    pyro.param — no sampling.  The guide for α_i is:
+
+        q(α_i)  =  Normal(loc_i, scale_i)
+
+    where loc_i and scale_i are free (8×8) variational parameters stored in
+    full-dataset tables (total_size, 8, 8) and indexed by batch_idx.
+    The variational scale is exposure-free; exposure-scaling belongs in the
+    model prior only.
+    """
     batch_size = len(batch_idx)
 
     portfolio = Portfolio(
         loan_amnt, installments, int_rate,
         num_timesteps, total_pre_chargeoff, last_pymnt_amnt,
-        device, scaling_factor
+        device, scaling_factor,
     )
 
-    tmat_logits, _ = tmat_provider.get_logits(batch_id, batch_idx, batch_size, device)
+    # ── Global params (outside plate) ────────────────────────────────────────
+    global_logits, _sigma_obs = register_global_params(batch_id, device, scaling_factor)
+    baseline_logits = Template.apply_mask(global_logits)   # (8, 8)
+
+    # σ_global must be registered here to keep the param store consistent
+    # across model and guide calls within the same SVI step.
+    pyro.param(
+        f"{batch_id}_sigma_global",
+        torch.tensor(0.5, device=device),
+        constraint=dist.constraints.positive,
+    )
+
+    # ── Loan-level variational params (outside plate) ────────────────────────
+    alpha_loc, alpha_scale = register_loan_params(batch_id, batch_idx, total_size, device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
+
+        # q(α_i) = Normal(loc_i, scale_i)
+        loan_offsets = pyro.sample(
+            f"alpha_{batch_id}",
+            dist.Normal(alpha_loc, alpha_scale).to_event(2)
+        )   # (batch_size, 8, 8)
+
+        tmat_logits = build_tmat_logits(baseline_logits, loan_offsets)
+
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
                 f"h_{batch_id}_{t}",
                 dist.Categorical(logits=tmat_logits[
                     torch.arange(batch_size, device=device),
-                    portfolio.current_hidden_states
+                    portfolio.current_hidden_states,
                 ])
             )
             portfolio.step(new_hidden_states)
