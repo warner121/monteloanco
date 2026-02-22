@@ -11,7 +11,8 @@ class Template:
     default).  The MASK encodes structurally forbidden transitions — entries set to
     True are clamped to -inf in logit space so the Categorical sampler assigns them
     zero probability.  DEMO_PROBS is the portfolio-level prior transition matrix,
-    elicited from domain knowledge and used to initialise the global logit parameter.
+    elicited from domain knowledge; it is now the fixed baseline — no learned global
+    offset layer sits above it.
     """
 
     MASK = torch.tensor([
@@ -26,14 +27,14 @@ class Template:
     ])
 
     DEMO_PROBS = torch.tensor([
-        [1.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 0.0,],
-        [0.030, 0.870, 0.10, 0.00, 0.00, 0.00, 0.00, 0.0,],
-        [0.025, 0.125, 0.05, 0.80, 0.00, 0.00, 0.00, 0.0,],
-        [0.020, 0.140, 0.00, 0.04, 0.80, 0.00, 0.00, 0.0,],
-        [0.015, 0.155, 0.00, 0.00, 0.03, 0.80, 0.00, 0.0,],
-        [0.010, 0.170, 0.00, 0.00, 0.00, 0.02, 0.80, 0.0,],
-        [0.005, 0.185, 0.00, 0.00, 0.00, 0.00, 0.01, 0.8,],
-        [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0,]
+        [1.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 0.0],
+        [0.030, 0.960, 0.01, 0.00, 0.00, 0.00, 0.00, 0.0],
+        [0.025, 0.325, 0.05, 0.60, 0.00, 0.00, 0.00, 0.0],
+        [0.020, 0.340, 0.00, 0.04, 0.60, 0.00, 0.00, 0.0],
+        [0.015, 0.355, 0.00, 0.00, 0.03, 0.60, 0.00, 0.0],
+        [0.010, 0.370, 0.00, 0.00, 0.00, 0.02, 0.60, 0.0],
+        [0.005, 0.385, 0.00, 0.00, 0.00, 0.00, 0.01, 0.6],
+        [0.000, 0.000, 0.00, 0.00, 0.00, 0.00, 0.00, 1.0],
     ])
 
     @staticmethod
@@ -46,32 +47,37 @@ class Template:
         return logits.masked_fill(Template.MASK.to(logits.device), float("-inf"))
 
 # Pre-compute the log-probability form of the prior transition matrix.
+# This is now the fixed baseline used directly in model/guide — it is never
+# updated by gradient descent.
 Template.DEMO_LOGITS = Template.probs_to_logits(Template.DEMO_PROBS)
 
 
 # ── Parameter helpers ─────────────────────────────────────────────────────────
 #
-# Parameter registration is split across three functions so that each layer can
-# be called independently — including from outside model()/guide() for inspection
-# or simulation after training.
+# The hierarchy has been reduced to two layers:
+#
+#   θ_i  =  mask(DEMO_LOGITS + α_i)
+#
+# DEMO_LOGITS is fixed (domain-knowledge baseline).  α_i is the only stochastic
+# layer — a per-loan offset drawn from a Normal prior.  There is no learned
+# global matrix sitting between them.
 #
 # Call order within a training step:
 #
-#   global_logits, sigma_obs = register_global_params(...)   # outside plate
-#   alpha_loc, alpha_scale   = register_loan_params(...)     # outside plate
+#   sigma_obs              = register_global_params(...)   # outside plate
+#   alpha_loc, alpha_scale = register_loan_params(...)     # outside plate
 #   with pyro.plate(...):
-#       loan_offsets = pyro.sample("alpha_...", ...)         # inside plate
-#       tmat_logits  = build_tmat_logits(...)                # inside plate
+#       loan_offsets = pyro.sample("alpha_...", ...)       # inside plate
+#       tmat_logits  = build_tmat_logits(...)              # inside plate
 #       ...
-#
-# All three functions are idempotent: pyro.param returns the existing tensor if
-# the name is already in the param store, so repeated calls within the same SVI
-# step are safe.
 
 
 def register_global_params(batch_id: str, device: str, scaling_factor: float):
     """
-    Register and return the portfolio-level parameters shared across all loans.
+    Register and return the scalar observation-noise parameter.
+
+    The learned global logit matrix has been removed.  DEMO_LOGITS is the fixed
+    baseline; only σ_obs remains as a trained scalar.
 
     Parameters
     ----------
@@ -81,23 +87,15 @@ def register_global_params(batch_id: str, device: str, scaling_factor: float):
 
     Returns
     -------
-    global_logits : (8, 8) — portfolio-level transition logit matrix Θ_global.
-                    Initialised from DEMO_LOGITS; unconstrained thereafter.
-                    Mask is applied at use-time so all permitted entries are free.
-    sigma_obs     : scalar — homoskedastic observation noise.  Positive-constrained.
+    sigma_obs : scalar — homoskedastic observation noise.  Positive-constrained.
     """
-    global_logits = pyro.param(
-        f"{batch_id}_global_logits",
-        Template.DEMO_LOGITS.to(device).clone(),
-    )   # (8, 8)
-
     sigma_obs = pyro.param(
         f"{batch_id}_sigma_obs",
         torch.tensor(50. / scaling_factor, device=device),
         constraint=dist.constraints.positive,
     )   # scalar
 
-    return global_logits, sigma_obs
+    return sigma_obs
 
 
 def register_loan_params(batch_id: str, batch_idx: torch.Tensor,
@@ -138,26 +136,25 @@ def register_loan_params(batch_id: str, batch_idx: torch.Tensor,
     return alpha_loc_all[batch_idx], alpha_scale_all[batch_idx]
 
 
-def build_tmat_logits(baseline_logits: torch.Tensor,
-                      loan_offsets: torch.Tensor):
+def build_tmat_logits(loan_offsets: torch.Tensor, device: str):
     """
-    Construct per-loan transition logits from the shared baseline and sampled
-    per-loan offsets.  Pure tensor arithmetic — no Pyro calls — so this can be
-    called freely outside model()/guide() given a baseline and offsets.
+    Construct per-loan transition logits from the fixed DEMO_LOGITS baseline and
+    sampled per-loan offsets.  Pure tensor arithmetic — no Pyro calls.
 
     Parameters
     ----------
-    baseline_logits : (8, 8) — mask(Θ_global), the portfolio-level logit matrix.
-    loan_offsets    : (batch_size, 8, 8) — sampled or posterior-mean per-loan
-                      offsets α_i.
+    loan_offsets : (batch_size, 8, 8) — sampled or posterior-mean per-loan
+                   offsets α_i.
+    device       : torch device string (used to move DEMO_LOGITS if needed).
 
     Returns
     -------
     tmat_logits : (batch_size, 8, 8) — structurally masked per-loan logits,
                   ready for Categorical sampling or softmax inspection.
     """
+    baseline = Template.DEMO_LOGITS.to(device)   # (8, 8), fixed
     return Template.apply_mask(
-        baseline_logits.unsqueeze(0) + loan_offsets
+        baseline.unsqueeze(0) + loan_offsets
     )   # (batch_size, 8, 8)
 
 
@@ -266,15 +263,23 @@ class Portfolio:
 
 # ── Model and guide ───────────────────────────────────────────────────────────
 #
-# Both functions have identical signatures.  The structure in each is:
+# The hierarchy is now:
 #
-#   1. register_global_params()  — Θ_global, σ_obs           (outside plate)
-#   2. register_loan_params()    — alpha_loc, alpha_scale     (outside plate)
+#   θ_i  =  mask(DEMO_LOGITS + α_i)
+#
+# DEMO_LOGITS is the fixed domain-knowledge baseline (never trained).
+# α_i is the sole stochastic layer — per-loan offsets from that baseline.
+# There is no global logit matrix and no σ_global parameter.
+#
+# Both functions have identical signatures.  Structure in each:
+#
+#   1. register_global_params()  — σ_obs only              (outside plate)
+#   2. register_loan_params()    — alpha_loc, alpha_scale   (outside plate)
 #   3. pyro.plate:
-#        a. pyro.sample alpha    — loan offsets α_i           (inside plate)
-#        b. build_tmat_logits()  — pure tensor op             (inside plate)
-#        c. Markov chain loop                                  (inside plate)
-#        d. observation sites                                  (inside plate)
+#        a. pyro.sample alpha    — loan offsets α_i         (inside plate)
+#        b. build_tmat_logits()  — pure tensor op           (inside plate)
+#        c. Markov chain loop                                (inside plate)
+#        d. observation sites                                (inside plate)
 
 def model(
     batch_id,
@@ -293,15 +298,15 @@ def model(
     Generative model for a batch of loans.
 
     Per-loan transition logits are:
-        θ_i  =  mask(Θ_global + α_i)
+        θ_i  =  mask(DEMO_LOGITS + α_i)
 
-    Θ_global is the learned portfolio-level matrix; α_i is a stochastic per-loan
-    offset drawn from an exposure-scaled Normal prior:
+    DEMO_LOGITS is the fixed domain-knowledge prior matrix.  α_i is a stochastic
+    per-loan offset drawn from an exposure-scaled Normal prior:
 
-        α_i  ~  Normal(0, σ_global / sqrt(T_i))
+        α_i  ~  Normal(0, 1 / sqrt(T_i))
 
     where T_i is the number of observed timesteps for loan i (clamped to 1).
-    Loans with short histories have wide priors and stay close to Θ_global;
+    Loans with short histories have wide priors and stay close to DEMO_LOGITS;
     loans with long histories are effectively pinned by their own data.
 
     Observation likelihood (when targets are provided):
@@ -316,23 +321,19 @@ def model(
         device, scaling_factor,
     )
 
-    # ── Global params (outside plate) ────────────────────────────────────────
-    global_logits, sigma_obs = register_global_params(batch_id, device, scaling_factor)
-    baseline_logits = Template.apply_mask(global_logits)   # (8, 8)
-
-    sigma_global = pyro.param(
-        f"{batch_id}_sigma_global",
-        torch.tensor(0.5, device=device),
-        constraint=dist.constraints.positive,
-    )
+    # ── Global params (outside plate) — σ_obs only ───────────────────────────
+    sigma_obs = register_global_params(batch_id, device, scaling_factor)
 
     # Exposure-scaled prior std: wide for short histories, narrow for long.
-    T = portfolio.num_timesteps.float().clamp(min=1)                  # (batch_size,)
-    prior_std = (sigma_global / T.sqrt()).view(-1, 1, 1).expand(batch_size, 8, 8)
+    T = portfolio.num_timesteps.float().clamp(min=1)                   # (batch_size,)
+    prior_std = (1.0 / T.sqrt()).view(-1, 1, 1).expand(batch_size, 8, 8)
+
+    # ── Loan-level params (outside plate) ────────────────────────────────────
+    alpha_loc, alpha_scale = register_loan_params(batch_id, batch_idx, total_size, device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
-        # α_i ~ Normal(0, σ_global / sqrt(T_i))
+        # α_i ~ Normal(0, 1 / sqrt(T_i))
         # to_event(2) declares (8, 8) as the event shape; the plate dim is loans.
         loan_offsets = pyro.sample(
             f"alpha_{batch_id}",
@@ -342,7 +343,7 @@ def model(
             ).to_event(2)
         )   # (batch_size, 8, 8)
 
-        tmat_logits = build_tmat_logits(baseline_logits, loan_offsets)
+        tmat_logits = build_tmat_logits(loan_offsets, device)
 
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
@@ -389,15 +390,13 @@ def guide(
     """
     Variational guide for model().
 
-    Deterministic parameters (Θ_global, σ_global, σ_obs) are registered via
-    pyro.param — no sampling.  The guide for α_i is:
+    The only deterministic parameter is σ_obs (registered via pyro.param, no
+    sampling).  The guide for α_i is:
 
         q(α_i)  =  Normal(loc_i, scale_i)
 
     where loc_i and scale_i are free (8×8) variational parameters stored in
     full-dataset tables (total_size, 8, 8) and indexed by batch_idx.
-    The variational scale is exposure-free; exposure-scaling belongs in the
-    model prior only.
     """
     batch_size = len(batch_idx)
 
@@ -407,17 +406,8 @@ def guide(
         device, scaling_factor,
     )
 
-    # ── Global params (outside plate) ────────────────────────────────────────
-    global_logits, _sigma_obs = register_global_params(batch_id, device, scaling_factor)
-    baseline_logits = Template.apply_mask(global_logits)   # (8, 8)
-
-    # σ_global must be registered here to keep the param store consistent
-    # across model and guide calls within the same SVI step.
-    pyro.param(
-        f"{batch_id}_sigma_global",
-        torch.tensor(0.5, device=device),
-        constraint=dist.constraints.positive,
-    )
+    # ── Global params (outside plate) — σ_obs only ───────────────────────────
+    register_global_params(batch_id, device, scaling_factor)
 
     # ── Loan-level variational params (outside plate) ────────────────────────
     alpha_loc, alpha_scale = register_loan_params(batch_id, batch_idx, total_size, device)
@@ -430,7 +420,7 @@ def guide(
             dist.Normal(alpha_loc, alpha_scale).to_event(2)
         )   # (batch_size, 8, 8)
 
-        tmat_logits = build_tmat_logits(baseline_logits, loan_offsets)
+        tmat_logits = build_tmat_logits(loan_offsets, device)
 
         for t in range(1, portfolio.max_timesteps + 1):
             new_hidden_states = pyro.sample(
