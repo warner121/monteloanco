@@ -72,32 +72,6 @@ Template.DEMO_LOGITS = Template.probs_to_logits(Template.DEMO_PROBS)
 #       ...
 
 
-def register_global_params(batch_id: str, device: str, scaling_factor: float):
-    """
-    Register and return the scalar observation-noise parameter.
-
-    The learned global logit matrix has been removed.  DEMO_LOGITS is the fixed
-    baseline; only σ_obs remains as a trained scalar.
-
-    Parameters
-    ----------
-    batch_id       : string prefix for all Pyro site names in this batch.
-    device         : torch device string.
-    scaling_factor : monetary divisor; initialises sigma_obs at a realistic value.
-
-    Returns
-    -------
-    sigma_obs : scalar — homoskedastic observation noise.  Positive-constrained.
-    """
-    sigma_obs = pyro.param(
-        f"{batch_id}_sigma_obs",
-        torch.tensor(50. / scaling_factor, device=device),
-        constraint=dist.constraints.positive,
-    )   # scalar
-
-    return sigma_obs
-
-
 def register_loan_params(batch_id: str, batch_idx: torch.Tensor,
                          total_size: int, device: str):
     """
@@ -321,9 +295,6 @@ def model(
         device, scaling_factor,
     )
 
-    # ── Global params (outside plate) — σ_obs only ───────────────────────────
-    sigma_obs = register_global_params(batch_id, device, scaling_factor)
-
     # Exposure-scaled prior std: wide for short histories, narrow for long.
     T = portfolio.num_timesteps.float().clamp(min=1)                   # (batch_size,)
     prior_std = (1.0 / T.sqrt()).view(-1, 1, 1).expand(batch_size, 8, 8)
@@ -357,18 +328,20 @@ def model(
 
         if torch.is_tensor(total_pre_chargeoff):
             pred = portfolio.get_total_pre_chargeoff()
+            std = (50. / scaling_factor) * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_total_{batch_id}",
-                dist.Normal(pred, sigma_obs),
-                obs=total_pre_chargeoff / scaling_factor,
+                dist.Normal(pred, std),
+                obs=total_pre_chargeoff / scaling_factor
             )
 
         if torch.is_tensor(last_pymnt_amnt):
             pred = portfolio.get_last_payment()
+            std = (50. / scaling_factor) * torch.sqrt(portfolio.num_timesteps.float())
             pyro.sample(
                 f"obs_last_{batch_id}",
-                dist.Normal(pred, sigma_obs),
-                obs=last_pymnt_amnt / scaling_factor,
+                dist.Normal(pred, std),
+                obs=last_pymnt_amnt / scaling_factor
             )
 
     return portfolio
@@ -406,9 +379,6 @@ def guide(
         device, scaling_factor,
     )
 
-    # ── Global params (outside plate) — σ_obs only ───────────────────────────
-    register_global_params(batch_id, device, scaling_factor)
-
     # ── Loan-level variational params (outside plate) ────────────────────────
     alpha_loc, alpha_scale = register_loan_params(batch_id, batch_idx, total_size, device)
 
@@ -431,3 +401,44 @@ def guide(
                 ])
             )
             portfolio.step(new_hidden_states)
+
+
+def simulate_portfolio_from_samples(samples, loan, bid, num_samples, num_timesteps, device):
+    """
+    Works for both a single loan (df row) and a batch dict from DataLoader.
+    """
+    if isinstance(loan, dict):
+        # DataLoader batch
+        loan_amnt    = loan['loan_amnt'].repeat_interleave(num_samples).to(device)
+        installments = loan['installment'].repeat_interleave(num_samples).to(device)
+        int_rate     = loan['int_rate'].repeat_interleave(num_samples).to(device)
+        if torch.is_tensor(num_timesteps):
+            num_timesteps_rep = num_timesteps.repeat_interleave(num_samples).to(device)
+        else:
+            num_timesteps_rep = num_timesteps
+    else:
+        # Single loan row from df_tmat
+        loan_amnt    = torch.tensor(loan.loan_amnt).repeat(num_samples).to(device)
+        installments = torch.tensor(loan.installment).repeat(num_samples).to(device)
+        int_rate     = torch.tensor(loan.int_rate).repeat(num_samples).to(device)
+        num_timesteps_rep = num_timesteps
+
+    max_t = num_timesteps.max().item() if torch.is_tensor(num_timesteps) else num_timesteps
+
+    hidden_state_sequence = [
+        samples[f"h_{bid}_{t}"].squeeze(-1).flatten()   # (num_samples * batch_size,)
+        for t in range(1, max_t + 1)
+    ]
+
+    portfolio = Portfolio(
+        loan_amnt=loan_amnt,
+        installments=installments,
+        int_rate=int_rate,
+        num_timesteps=num_timesteps_rep,
+        device=device,
+    )
+
+    for new_states in hidden_state_sequence:
+        portfolio.step(new_states.to(device))
+
+    return portfolio
