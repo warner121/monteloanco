@@ -52,63 +52,6 @@ class Template:
 Template.DEMO_LOGITS = Template.probs_to_logits(Template.DEMO_PROBS)
 
 
-# ── Parameter helpers ─────────────────────────────────────────────────────────
-#
-# The hierarchy has been reduced to two layers:
-#
-#   θ_i  =  mask(DEMO_LOGITS + α_i)
-#
-# DEMO_LOGITS is fixed (domain-knowledge baseline).  α_i is the only stochastic
-# layer — a per-loan offset drawn from a Normal prior.  There is no learned
-# global matrix sitting between them.
-#
-# Call order within a training step:
-#
-#   sigma_obs              = register_global_params(...)   # outside plate
-#   alpha_loc, alpha_scale = register_loan_params(...)     # outside plate
-#   with pyro.plate(...):
-#       loan_offsets = pyro.sample("alpha_...", ...)       # inside plate
-#       tmat_logits  = build_tmat_logits(...)              # inside plate
-#       ...
-
-
-def register_loan_params(batch_id: str, batch_idx: torch.Tensor,
-                         total_size: int, device: str):
-    """
-    Register the full-dataset variational parameter tables and return the rows
-    corresponding to the current batch.
-
-    The tables are indexed by loan position in the full dataset.  Only the rows
-    for batch_idx are returned; gradients flow back to those rows only.
-
-    Parameters
-    ----------
-    batch_id   : string prefix for Pyro site names.
-    batch_idx  : 1-D integer tensor of loan indices into the full dataset,
-                 shape (batch_size,).
-    total_size : total number of distinct loans in the dataset.
-    device     : torch device string.
-
-    Returns
-    -------
-    alpha_loc   : (batch_size, 8, 8) — variational mean for each loan's offset α_i.
-                  Initialised at zero (prior mean).
-    alpha_scale : (batch_size, 8, 8) — variational std for each loan's offset α_i.
-                  Positive-constrained; initialised small for numerical stability.
-    """
-    alpha_loc_all = pyro.param(
-        f"{batch_id}_alpha_loc",
-        torch.zeros(total_size, 8, 8, device=device),
-    )   # (total_size, 8, 8)
-
-    alpha_scale_all = pyro.param(
-        f"{batch_id}_alpha_scale",
-        torch.full((total_size, 8, 8), 0.1, device=device),
-        constraint=dist.constraints.positive,
-    )   # (total_size, 8, 8)
-
-    return alpha_loc_all[batch_idx], alpha_scale_all[batch_idx]
-
 
 def build_tmat_logits(loan_offsets: torch.Tensor, device: str):
     """
@@ -247,9 +190,8 @@ class Portfolio:
 #
 # Both functions have identical signatures.  Structure in each:
 #
-#   1. register_global_params()  — σ_obs only              (outside plate)
-#   2. register_loan_params()    — alpha_loc, alpha_scale   (outside plate)
-#   3. pyro.plate:
+#   1. alpha_loc, alpha_scale    — pyro.param directly      (outside plate)
+#   2. pyro.plate:
 #        a. pyro.sample alpha    — loan offsets α_i         (inside plate)
 #        b. build_tmat_logits()  — pure tensor op           (inside plate)
 #        c. Markov chain loop                                (inside plate)
@@ -261,7 +203,6 @@ def model(
     installments,
     loan_amnt,
     int_rate,
-    total_size,
     total_pre_chargeoff=None,
     last_pymnt_amnt=None,
     num_timesteps=60,
@@ -298,9 +239,6 @@ def model(
     # Exposure-scaled prior std: wide for short histories, narrow for long.
     T = portfolio.num_timesteps.float().clamp(min=1)                   # (batch_size,)
     prior_std = (1.0 / T.sqrt()).view(-1, 1, 1).expand(batch_size, 8, 8)
-
-    # ── Loan-level params (outside plate) ────────────────────────────────────
-    alpha_loc, alpha_scale = register_loan_params(batch_id, batch_idx, total_size, device)
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
@@ -353,7 +291,6 @@ def guide(
     installments,
     loan_amnt,
     int_rate,
-    total_size,
     total_pre_chargeoff=None,
     last_pymnt_amnt=None,
     num_timesteps=60,
@@ -363,13 +300,14 @@ def guide(
     """
     Variational guide for model().
 
-    The only deterministic parameter is σ_obs (registered via pyro.param, no
-    sampling).  The guide for α_i is:
+    The guide for α_i is:
 
         q(α_i)  =  Normal(loc_i, scale_i)
 
-    where loc_i and scale_i are free (8×8) variational parameters stored in
-    full-dataset tables (total_size, 8, 8) and indexed by batch_idx.
+    where loc_i is a free (8×8) variational mean and scale_i is a per-loan
+    scalar std, both stored in per-batch Pyro param tables keyed by batch_id.
+    batch_idx selects the relevant rows — during training this is arange(batch_size);
+    at inference time it identifies individual loans within the stored table.
     """
     batch_size = len(batch_idx)
 
@@ -379,8 +317,20 @@ def guide(
         device, scaling_factor,
     )
 
-    # ── Loan-level variational params (outside plate) ────────────────────────
-    alpha_loc, alpha_scale = register_loan_params(batch_id, batch_idx, total_size, device)
+    # ── Variational parameters: per-loan offset mean and variance ────────────
+    # Tables are sized to the full batch at registration time; batch_idx selects
+    # the relevant rows (arange during training, specific indices at inference).
+    # alpha_loc   : (batch_size, 8, 8) — one mean per transition logit per loan
+    # alpha_scale : (batch_size, 1, 1) — one std per loan, broadcasts over (8, 8)
+    alpha_loc = pyro.param(
+        f"{batch_id}_alpha_loc",
+        torch.zeros(batch_size, 8, 8, device=device),
+    )[batch_idx]
+    alpha_scale = pyro.param(
+        f"{batch_id}_alpha_scale",
+        torch.full((batch_size, 1, 1), 0.1, device=device),
+        constraint=dist.constraints.positive,
+    )[batch_idx]
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
