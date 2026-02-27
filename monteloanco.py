@@ -216,13 +216,13 @@ def model(
         θ_i  =  mask(DEMO_LOGITS + α_i)
 
     DEMO_LOGITS is the fixed domain-knowledge prior matrix.  α_i is a stochastic
-    per-loan offset drawn from an exposure-scaled Normal prior:
+    per-loan offset drawn from a fully Bayesian Normal prior:
 
-        α_i  ~  Normal(0, 1 / sqrt(T_i))
+        α_i  ~  Normal(0, prior_std)
 
-    where T_i is the number of observed timesteps for loan i (clamped to 1).
-    Loans with short histories have wide priors and stay close to DEMO_LOGITS;
-    loans with long histories are effectively pinned by their own data.
+    where prior_std is a single global learnable parameter (positive-constrained,
+    initialised to 1.0) inferred jointly with the rest of the model.  It is NOT
+    scaled by the number of observed timesteps T.
 
     Observation likelihood (when targets are provided):
         total_pre_chargeoff  ~  Normal(simulated_total,  σ_obs)
@@ -236,13 +236,16 @@ def model(
         device, scaling_factor,
     )
 
-    # Exposure-scaled prior std: wide for short histories, narrow for long.
-    T = portfolio.num_timesteps.float().clamp(min=1)                   # (batch_size,)
-    prior_std = (1.0 / T.sqrt()).view(-1, 1, 1).expand(batch_size, 8, 8)
+    # Fully Bayesian tunable prior std: a single learnable scalar, not scaled by T.
+    prior_std = pyro.param(
+        "prior_std",
+        torch.tensor(1.0, device=device),
+        constraint=dist.constraints.positive,
+    )
 
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
-        # α_i ~ Normal(0, 1 / sqrt(T_i))
+        # α_i ~ Normal(0, prior_std)
         # to_event(2) declares (8, 8) as the event shape; the plate dim is loans.
         loan_offsets = pyro.sample(
             f"alpha_{batch_id}",
