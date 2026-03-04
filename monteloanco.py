@@ -1,6 +1,8 @@
 import torch
+import torch.nn as nn
 import pyro
 import pyro.distributions as dist
+from pyro.nn import PyroModule
 
 
 class Template:
@@ -58,6 +60,33 @@ class Template:
     def apply_mask(logits: torch.Tensor) -> torch.Tensor:
         """Zero out structurally forbidden transitions in logit space (-inf)."""
         return logits.masked_fill(Template.MASK.to(logits.device), float("-inf"))
+
+
+class EmbeddingDecoderNet(PyroModule):
+    """
+    Decode a low-dimensional per-loan embedding into an (8, 8) logit-offset matrix.
+
+    A single linear layer maps (batch_size, embedding_size) -> (batch_size, 64),
+    which is reshaped to (batch_size, 8, 8).  The output is an *additive offset*
+    in logit space: it is added to DEMO_LOGITS inside construct_transition_logits,
+    not passed through softmax itself.
+    """
+
+    def __init__(self, embedding_size: int):
+        super().__init__()
+        self.linear = nn.Linear(embedding_size, 64)   # 64 = 8 * 8
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        embeddings : (batch_size, embedding_size)
+
+        Returns
+        -------
+        offsets : (batch_size, 8, 8)  -- additive logit offsets, unmasked.
+        """
+        return self.linear(embeddings).reshape(-1, 8, 8)
 
 
 # Fixed prior mean for per-loan transition logits, derived from domain knowledge.
@@ -282,6 +311,8 @@ def model(
     num_timesteps=60,
     device="cuda:0",
     scaling_factor=1_000_000,
+    embedding_size=3,
+    transition_net=None,
 ):
     """
     Generative model for a batch of loans under a hierarchical Bayesian
@@ -351,8 +382,8 @@ def model(
     # LogNormal ensures sigma_base > 0 without an explicit positivity constraint.
     global_logit_scale = pyro.sample(
         "sigma_base",
-        dist.LogNormal(torch.tensor(0.0, device=device),
-                       torch.tensor(1.0, device=device)),
+        dist.LogNormal(torch.tensor(-1.0, device=device),
+                       torch.tensor(0.5, device=device)),
     )
 
     # -- Level 1: history-adjusted prior std for each loan --------------------
@@ -371,13 +402,18 @@ def model(
     )                                                                   # (batch_size,)
     per_loan_prior_std = per_loan_prior_std.reshape(batch_size, 1, 1)  # broadcast over (8, 8)
 
+    # Register the decoder network as a Pyro module (shared across all loans).
+    # The decoder is not called in the model -- alpha_i is sampled directly in
+    # (8, 8) space.  The decoder lives only in the guide, where it reparameterises
+    # the variational mean from (embedding_size,) -> (8, 8) before sampling.
+    pyro.module("transition_net", transition_net)
+
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
         # -- Level 2: per-loan logit perturbations alpha_i --------------------
-        # alpha_i ~ Normal(0, sigma_i),  shape (8, 8) declared via .to_event(2).
-        # The plate dimension (-1) indexes loans; (8, 8) is the event shape.
-        # Prior mean is zero: no expected deviation from the domain-knowledge
-        # baseline DEMO_LOGITS without evidence from observed data.
+        # alpha_i ~ Normal(0, sigma_i),  shape (8, 8) via .to_event(2).
+        # Unchanged from the original: the model always works in (8, 8) space.
+        # Parameter compression happens only in the guide via the decoder.
         per_loan_logit_offsets = pyro.sample(
             f"alpha_{batch_id}",
             dist.Normal(
@@ -420,7 +456,7 @@ def model(
         if torch.is_tensor(total_pre_chargeoff):
             # Observation: total payments received within the observed window.
             simulated_total = simulator.get_total_pre_chargeoff()
-            obs_std = (50. / scaling_factor) * torch.sqrt(simulator.num_timesteps.float())
+            obs_std = (100. / scaling_factor) * torch.sqrt(simulator.num_timesteps.float())
             pyro.sample(
                 f"obs_total_{batch_id}",
                 dist.Normal(simulated_total, obs_std),
@@ -430,7 +466,7 @@ def model(
         if torch.is_tensor(last_pymnt_amnt):
             # Observation: last payment amount within the observed window.
             simulated_last = simulator.get_last_payment()
-            obs_std = (50. / scaling_factor) * torch.sqrt(simulator.num_timesteps.float())
+            obs_std = (100. / scaling_factor) * torch.sqrt(simulator.num_timesteps.float())
             pyro.sample(
                 f"obs_last_{batch_id}",
                 dist.Normal(simulated_last, obs_std),
@@ -451,6 +487,8 @@ def guide(
     num_timesteps=60,
     device="cuda:0",
     scaling_factor=1_000_000,
+    embedding_size=3,
+    transition_net=None,
 ):
     """
     Mean-field variational guide for model().
@@ -507,7 +545,7 @@ def guide(
     # sigma_base_scale: log-space variational std for sigma_base (positive).
     variational_logscale_loc = pyro.param(
         "sigma_base_loc",
-        torch.tensor(0.0, device=device),
+        torch.tensor(-1.0, device=device),
     )
     variational_logscale_std = pyro.param(
         "sigma_base_scale",
@@ -519,19 +557,19 @@ def guide(
         dist.LogNormal(variational_logscale_loc, variational_logscale_std),
     )
 
+    # Register the decoder network (must match the model's pyro.module call).
+    transition_net = pyro.module("transition_net", transition_net)
+
     # -- Variational distribution for per-loan logit perturbations alpha_i ----
-    # q(alpha_i) = Normal(mu_i, s_i)
+    # q(alpha_i) = Normal(decoder(mu_i), s_i),  shape (8, 8) via .to_event(2).
     #
-    # Parameter tables are sized to the full batch at registration time;
-    # batch_idx selects the rows for the current mini-batch or inference query.
-    #
-    # alpha_variational_loc   : (batch_size, 8, 8) -- variational mean mu_i;
-    #                           one free parameter per transition logit per loan.
-    # alpha_variational_scale : (batch_size, 1, 1) -- per-loan variational std s_i;
-    #                           broadcasts across the (8, 8) event shape.
+    # _alpha_loc  : (batch_size, embedding_size) -- compressed variational mean;
+    #               decoded to (batch_size, 8, 8) before parameterising the Normal.
+    # _alpha_scale: (batch_size, 1, 1) -- per-loan scalar variational std s_i;
+    #               broadcasts across the (8, 8) event shape.
     alpha_variational_loc = pyro.param(
         f"{batch_id}_alpha_loc",
-        torch.zeros(batch_size, 8, 8, device=device),
+        torch.zeros(batch_size, embedding_size, device=device),
     )[batch_idx]
     alpha_variational_scale = pyro.param(
         f"{batch_id}_alpha_scale",
@@ -539,18 +577,20 @@ def guide(
         constraint=dist.constraints.positive,
     )[batch_idx]
 
+    # Decode the compressed (embedding_size,) loc to a full (8, 8) loc matrix.
+    # Deterministic reparameterisation of the variational mean -- the sample
+    # site shape remains (8, 8), matching the model's alpha_i exactly.
+    alpha_loc_decoded = transition_net(alpha_variational_loc)           # (batch_size, 8, 8)
+
     with pyro.plate(f"batch_{batch_id}", batch_size, dim=-1):
 
-        # q(alpha_i) = Normal(mu_i, s_i),  shape (8, 8) via .to_event(2).
+        # q(alpha_i) = Normal(decoder(mu_i), s_i),  shape (8, 8) via .to_event(2).
         per_loan_logit_offsets = pyro.sample(
             f"alpha_{batch_id}",
-            dist.Normal(alpha_variational_loc, alpha_variational_scale).to_event(2)
+            dist.Normal(alpha_loc_decoded, alpha_variational_scale).to_event(2)
         )   # (batch_size, 8, 8)
 
-        # Per-loan transition logits theta_i = mask( DEMO_LOGITS + alpha_i ).
-        # Deterministic given the sampled alpha_i -- required to propagate the
-        # latent delinquency-state sequence through the guide in lockstep with
-        # the model so the ELBO can be evaluated at each h_{batch_id}_{t}.
+        # Per-loan transition logits: theta_i = mask( DEMO_LOGITS + alpha_i ).
         per_loan_transition_logits = construct_transition_logits(
             per_loan_logit_offsets, device
         )
